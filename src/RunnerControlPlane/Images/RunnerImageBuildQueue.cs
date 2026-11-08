@@ -121,6 +121,11 @@ public sealed class RunnerImageBuildQueue(
             return "The built image did not contain exactly the pinned .NET SDK versions.";
         }
 
+        if (request.Packages.Count != inventory.Packages.Count)
+        {
+            return "The built image did not contain exactly the pinned package set.";
+        }
+
         foreach (var package in request.Packages)
         {
             if (!inventory.Packages.TryGetValue(package.Key, out var installedVersion)
@@ -137,9 +142,8 @@ public sealed class RunnerImageBuildQueue(
     {
         return inventory with
         {
-            DotNetSdks = Array.AsReadOnly(inventory.DotNetSdks.ToArray()),
-            Packages = new ReadOnlyDictionary<string, string>(
-                new Dictionary<string, string>(inventory.Packages, StringComparer.OrdinalIgnoreCase))
+            DotNetSdks = FreezeSdks(inventory.DotNetSdks),
+            Packages = FreezePackages(inventory.Packages)
         };
     }
 
@@ -147,10 +151,21 @@ public sealed class RunnerImageBuildQueue(
     {
         return request with
         {
-            DotNetSdks = Array.AsReadOnly(request.DotNetSdks.ToArray()),
-            Packages = new ReadOnlyDictionary<string, string>(
-                new Dictionary<string, string>(request.Packages, StringComparer.OrdinalIgnoreCase))
+            DotNetSdks = FreezeSdks(request.DotNetSdks),
+            Packages = FreezePackages(request.Packages)
         };
+    }
+
+    private static IReadOnlyList<string> FreezeSdks(IReadOnlyList<string> sdks)
+    {
+        return Array.AsReadOnly(sdks.ToArray());
+    }
+
+    private static IReadOnlyDictionary<string, string> FreezePackages(
+        IReadOnlyDictionary<string, string> packages)
+    {
+        return new ReadOnlyDictionary<string, string>(
+            new Dictionary<string, string>(packages, StringComparer.OrdinalIgnoreCase));
     }
 
     private sealed record QueuedBuild(string Version, RunnerImageBuildRequest Request);

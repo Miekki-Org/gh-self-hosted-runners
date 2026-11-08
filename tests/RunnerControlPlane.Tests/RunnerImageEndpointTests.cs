@@ -166,6 +166,22 @@ public sealed class RunnerImageEndpointTests
         Assert.Empty(available!);
     }
 
+    [Fact]
+    public async Task ImageWithUnrequestedPackagesIsNotMadeAvailable()
+    {
+        using var factory = new RunnerImageControlPlaneFactory(extraPackage: true);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var response = await RequestBuildAsync(client);
+        var queued = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        var failed = await WaitForStatusAsync(client, queued!.Version, RunnerImageBuildStatus.Failed);
+        var available = await client.GetFromJsonAsync<RunnerImage[]>("/api/runner-images/available", JsonOptions);
+
+        Assert.Contains("did not contain exactly the pinned package set", failed.FailureReason);
+        Assert.Empty(available!);
+    }
+
     private static Task<HttpResponseMessage> RequestBuildAsync(HttpClient client, bool expedited = true)
     {
         return client.PostAsJsonAsync(
@@ -208,10 +224,11 @@ public sealed class RunnerImageEndpointTests
         public RunnerImageControlPlaneFactory(
             bool failValidation = false,
             bool holdBuilds = false,
-            bool mismatchInventory = false)
+            bool mismatchInventory = false,
+            bool extraPackage = false)
         {
             _failValidation = failValidation;
-            Builder = new FakeRunnerImageBuilder(holdBuilds, mismatchInventory);
+            Builder = new FakeRunnerImageBuilder(holdBuilds, mismatchInventory, extraPackage);
         }
 
         public FakeRunnerImageBuilder Builder { get; }
@@ -257,7 +274,10 @@ public sealed class RunnerImageEndpointTests
         }
     }
 
-    public sealed class FakeRunnerImageBuilder(bool holdBuilds, bool mismatchInventory) : IRunnerImageBuilder
+    public sealed class FakeRunnerImageBuilder(
+        bool holdBuilds,
+        bool mismatchInventory,
+        bool extraPackage) : IRunnerImageBuilder
     {
         private int _buildCount;
         private readonly TaskCompletionSource _releaseFirstBuild = new(
@@ -291,10 +311,16 @@ public sealed class RunnerImageEndpointTests
                 await _releaseSecondBuild.Task.WaitAsync(cancellationToken);
             }
 
+            var packages = new Dictionary<string, string> { ["curl"] = "8.5.0" };
+            if (extraPackage)
+            {
+                packages["unrequested-tool"] = "1.0.0";
+            }
+
             return new RunnerImageArtifact(new RunnerImageInventory(
                 "24.04",
                 ["8.0.404", "9.0.203"],
-                new Dictionary<string, string> { ["curl"] = "8.5.0" },
+                packages,
                 mismatchInventory ? "2.330.0" : "2.331.0"));
         }
     }
