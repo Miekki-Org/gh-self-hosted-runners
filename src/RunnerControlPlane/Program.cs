@@ -154,7 +154,7 @@ builder.Services
         var entra = entraOptions.Value;
         options.Authority = $"https://login.microsoftonline.com/{entra.TenantId}/v2.0";
         options.Audience = string.IsNullOrWhiteSpace(entra.ApiAudience)
-            ? $"api://{entra.ClientId}"
+            ? entra.ClientId
             : entra.ApiAudience;
         options.MapInboundClaims = false;
         options.TokenValidationParameters.NameClaimType = "name";

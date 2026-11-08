@@ -101,6 +101,8 @@ Open `https://localhost:7142` and sign in. The page should show the configured o
 
 - Startup errors such as `Entra:ClientSecret is required` identify the setting to add. The reader and operator group IDs must also be different.
 - `AADSTS50011` means the redirect URI in Entra does not exactly match `https://localhost:7142/signin-oidc`.
+- If an API request returns `401` with an issuer such as `https://sts.windows.net/<tenant-id>/`, the token is v1, but this API is configured to validate v2 tokens. In the API app registration manifest, set `api.requestedAccessTokenVersion` to `2`, save, and acquire a fresh token. Also ensure the token's `tid` matches `Entra:TenantId`; for Azure CLI, sign in to that tenant with `az login --tenant "<tenant-id>"`.
+- If an API request returns `401` with `The audience '...' is invalid`, ensure `Entra:ApiAudience` matches the API's client ID, then restart the app. For v2 tokens, the `aud` claim is the API client ID.
 - If sign-in succeeds but the page reports access denied, check that the user is in one of the configured groups and that the token contains its object ID in the `groups` claim.
 - The GitHub settings are independently required; once Entra validation passes, missing GitHub settings can still prevent startup.
 - GitHub API failures appear in the app as a generic “Unable to update or read the GitHub runner group” message. If checking the same token with GitHub CLI, `401` usually means the token is invalid or expired; `403` points to missing **Self-hosted runners: Read and write**, missing access to a private repository, insufficient organization-owner/admin access, or a token that needs organization approval.
@@ -116,14 +118,14 @@ Open `https://localhost:7142` and sign in. The page should show the configured o
 | `Entra__ClientSecret` | Entra application client secret value |
 | `Entra__ReadOnlyGroupId` | Entra group object ID with read-only access |
 | `Entra__OperatorGroupId` | Entra group object ID with operator access |
-| `Entra__ApiAudience` | Optional API audience; defaults to `api://<client-id>` |
+| `Entra__ApiAudience` | Optional API audience; defaults to the Entra application/client ID |
 | `GitHub__Organization` | Organization URL slug managed by this instance (not a personal username) |
 | `GitHub__Token` | Fine-grained PAT with organization Self-hosted runners read/write and access to repositories to manage |
 | `GitHub__RunnerGroupId` | Numeric ID of the organization's runner group; use the default group on GitHub Free |
 | `GitHub__ApiBaseUrl` | Optional GitHub API URL; defaults to `https://api.github.com/` |
 | `Runner__Label` | Stable runner label; defaults to `linux-dotnet` |
 
-`Entra:ApiAudience` only needs an explicit value when configuring API bearer-token clients; browser sign-in uses the OIDC client settings. The application's JWT validation requires tokens from the configured tenant. Do not use User Secrets for production.
+`Entra:ApiAudience` only needs an explicit value when configuring API bearer-token clients; browser sign-in uses the OIDC client settings. The default matches the API client ID used as `aud` in v2 access tokens. The API validates tokens from the configured tenant's v2 authority, so the API registration must request v2 access tokens (`api.requestedAccessTokenVersion: 2`), and the token's `tid` must match `Entra:TenantId`. A generic token from `az login` or `az account get-access-token` without an API scope is not suitable. Do not use User Secrets for production.
 
 The group must belong to the configured organization. Whenever an operator saves the allowlist, the application replaces its selected repository IDs and sets visibility to selected repositories with public-repository access disabled. Repository allowlist entries use `organization/repository` names and are resolved to repository IDs before the GitHub group is updated.
 
