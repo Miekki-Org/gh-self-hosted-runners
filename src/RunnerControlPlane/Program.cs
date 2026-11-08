@@ -14,16 +14,16 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services
     .AddOptions<EntraOptions>()
     .BindConfiguration("Entra")
-    .Validate(options =>
-            !string.IsNullOrWhiteSpace(options.TenantId)
-            && !string.IsNullOrWhiteSpace(options.ClientId)
-            && !string.IsNullOrWhiteSpace(options.ClientSecret)
-            && !string.IsNullOrWhiteSpace(options.ReadOnlyGroupId)
-            && !string.IsNullOrWhiteSpace(options.OperatorGroupId)
-            && !options.ReadOnlyGroupId.Equals(
-                options.OperatorGroupId,
-                StringComparison.OrdinalIgnoreCase),
-        "Entra tenant, application, secret, and both group IDs must be configured.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.TenantId), "Entra:TenantId is required.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.ClientId), "Entra:ClientId is required.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.ClientSecret), "Entra:ClientSecret is required.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.ReadOnlyGroupId), "Entra:ReadOnlyGroupId is required.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.OperatorGroupId), "Entra:OperatorGroupId is required.")
+    .Validate(
+        options => string.IsNullOrWhiteSpace(options.ReadOnlyGroupId)
+            || string.IsNullOrWhiteSpace(options.OperatorGroupId)
+            || !options.ReadOnlyGroupId.Equals(options.OperatorGroupId, StringComparison.OrdinalIgnoreCase),
+        "Entra:ReadOnlyGroupId and Entra:OperatorGroupId must be different group object IDs.")
     .ValidateOnStart();
 
 builder.Services

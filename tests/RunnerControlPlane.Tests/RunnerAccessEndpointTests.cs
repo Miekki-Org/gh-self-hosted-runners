@@ -142,11 +142,48 @@ public sealed class RunnerAccessEndpointTests
         Assert.True(factory.GitHubApi.AllowsPublicRepositories);
     }
 
+    [Theory]
+    [InlineData("Entra:TenantId")]
+    [InlineData("Entra:ClientId")]
+    [InlineData("Entra:ClientSecret")]
+    [InlineData("Entra:ReadOnlyGroupId")]
+    [InlineData("Entra:OperatorGroupId")]
+    public void MissingEntraSettingIsNamedInTheStartupError(string settingName)
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?> { [settingName] = "" });
+
+        var exception = Record.Exception(() => factory.CreateClient());
+
+        Assert.NotNull(exception);
+        Assert.Contains($"{settingName} is required", exception.ToString());
+    }
+
+    [Fact]
+    public void MatchingEntraGroupIdsAreRejectedAtStartup()
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["Entra:OperatorGroupId"] = "reader-group"
+            });
+
+        var exception = Record.Exception(() => factory.CreateClient());
+
+        Assert.NotNull(exception);
+        Assert.Contains("Entra:ReadOnlyGroupId and Entra:OperatorGroupId must be different", exception.ToString());
+    }
+
     private sealed class RunnerControlPlaneFactory : WebApplicationFactory<Program>
     {
-        public RunnerControlPlaneFactory(bool groupAllowsAllRepositories = false)
+        private readonly IReadOnlyDictionary<string, string?> _configurationOverrides;
+
+        public RunnerControlPlaneFactory(
+            bool groupAllowsAllRepositories = false,
+            IReadOnlyDictionary<string, string?>? configurationOverrides = null)
         {
             GitHubApi = new FakeGitHubApiHandler(groupAllowsAllRepositories);
+            _configurationOverrides = configurationOverrides ?? new Dictionary<string, string?>();
         }
 
         public FakeGitHubApiHandler GitHubApi { get; }
@@ -156,7 +193,7 @@ public sealed class RunnerAccessEndpointTests
             builder.ConfigureAppConfiguration((_, configuration) =>
             {
                 configuration.Sources.Clear();
-                configuration.AddInMemoryCollection(new Dictionary<string, string?>
+                var settings = new Dictionary<string, string?>
                 {
                     ["Entra:TenantId"] = "tenant-id",
                     ["Entra:ClientId"] = "client-id",
@@ -167,7 +204,13 @@ public sealed class RunnerAccessEndpointTests
                     ["GitHub:Token"] = "test-token",
                     ["GitHub:RunnerGroupId"] = "42",
                     ["Runner:Label"] = "linux-dotnet"
-                });
+                };
+                foreach (var setting in _configurationOverrides)
+                {
+                    settings[setting.Key] = setting.Value;
+                }
+
+                configuration.AddInMemoryCollection(settings);
             });
 
             builder.ConfigureTestServices(services =>
