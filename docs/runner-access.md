@@ -30,15 +30,60 @@ dotnet user-secrets set "Entra:OperatorGroupId" "<operator-group-object-id>" --p
 
 Keep the real client-secret value out of shell history where possible. User Secrets are local development convenience storage, not encrypted production secret storage.
 
-The app also validates GitHub settings at startup. Set the organization, token, and numeric runner-group ID in User Secrets:
+### 2. Configure GitHub for a Free organization
+
+This app calls GitHub's **organization** runner-group API. `GitHub:Organization` must therefore be your organization URL slug (the part after `github.com/`), not your personal username. The repository you manage must belong to that organization; a repository still owned by your personal account cannot be added to this organization's allowlist.
+
+GitHub Free organizations have one default runner group. Use it; creating additional organization runner groups requires GitHub Team. See [GitHub's runner-group documentation](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access).
+
+#### Find the default runner-group ID
+
+In the organization, open **Settings → Actions → Runner groups** and confirm the default group is present. To get its numeric ID, use GitHub CLI signed in as an organization owner with permission to read runner groups. If needed, authenticate with `gh auth login` and confirm the account with `gh auth status`:
 
 ```sh
-dotnet user-secrets set "GitHub:Organization" "<organization>" --project src/RunnerControlPlane
-dotnet user-secrets set "GitHub:Token" "<github-token>" --project src/RunnerControlPlane
-dotnet user-secrets set "GitHub:RunnerGroupId" "<runner-group-id>" --project src/RunnerControlPlane
+gh api "orgs/<org-slug>/actions/runner-groups" \
+  --jq '.runner_groups[] | select(.default) | [.id, .name] | @tsv'
 ```
 
-The GitHub token must be able to read the selected repositories and modify the organization's self-hosted runner groups. GitHub App tokens need `organization_self_hosted_runners` write permission and repository metadata read access; classic personal access tokens need the `admin:org` scope and repository access. Do not attach a new or permissive runner group to active runners before saving its first allowlist. For a fail-closed bootstrap, initialize the group with selected-repository visibility, public-repository access disabled, and no selected repositories.
+Replace `<org-slug>` with your organization's URL slug. The command prints the default group's numeric ID and name; use the ID, not the name, for `GitHub:RunnerGroupId`. If the result is empty or access is denied, check the organization slug and that `gh auth status` shows the owner account.
+
+#### Create a GitHub token
+
+For local development, create a **fine-grained personal access token** from GitHub **Settings → Developer settings → Personal access tokens → Fine-grained tokens**:
+
+1. Choose your new organization as the **Resource owner**.
+2. Under **Repository access**, select the organization repositories you might add to the app's allowlist. The token must have access to each private repository whose metadata the app will look up.
+3. Under **Organization permissions**, set **Self-hosted runners** to **Read and write**. The app reads the runner group and its selected repositories, then updates the selected-repository list and group visibility.
+4. Choose an expiration, generate the token, and copy its value. Your GitHub account must have organization-owner/admin access; a token cannot grant more access than its owner has. Replace the token in User Secrets when it expires.
+
+GitHub includes the repository **Metadata: Read-only** permission for fine-grained tokens. See the [fine-grained token permission reference](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens#organization-permissions-for-self-hosted-runners). If using a classic personal access token instead, it needs `admin:org` and, for private repositories, `repo`; prefer the fine-grained token because it can be limited to this organization and selected repositories.
+
+#### Store the GitHub values in User Secrets
+
+From the repository root, set the organization slug and numeric group ID. Substitute your actual values:
+
+```sh
+dotnet user-secrets set "GitHub:Organization" "<org-slug>" --project src/RunnerControlPlane
+dotnet user-secrets set "GitHub:RunnerGroupId" "<default-runner-group-id>" --project src/RunnerControlPlane
+```
+
+Set the token without putting its value directly into a command saved in shell history. In macOS's default `zsh`, enter it at the hidden prompt:
+
+```sh
+read -s "GITHUB_TOKEN?Paste the fine-grained token (input hidden): "
+echo
+dotnet user-secrets set "GitHub:Token" "$GITHUB_TOKEN" --project src/RunnerControlPlane
+unset GITHUB_TOKEN
+```
+
+You can check the non-secret values without printing the token:
+
+```sh
+dotnet user-secrets get "GitHub:Organization" --project src/RunnerControlPlane
+dotnet user-secrets get "GitHub:RunnerGroupId" --project src/RunnerControlPlane
+```
+
+The app's first allowlist save sets the group to selected-repository access and disables public-repository access. To bootstrap safely, sign in as an Entra operator, leave **Allowed repositories** empty, and click **Save allowlist** before registering active self-hosted runners in the default group. If runners are already active in that group, pause their use until the empty allowlist is saved. Then add only the repositories you intend to use and save again.
 
 ### 3. Run from VS Code
 
@@ -50,7 +95,7 @@ dotnet restore RunnerControlPlane.sln
 dotnet run --project src/RunnerControlPlane --launch-profile https
 ```
 
-Open `https://localhost:7142` and sign in. The HTTPS launch profile sets `ASPNETCORE_ENVIRONMENT=Development`, which enables User Secrets loading. Use `Ctrl+C` in the terminal to stop the app.
+Open `https://localhost:7142` and sign in. The page should show the configured organization and runner-group name. The HTTPS launch profile sets `ASPNETCORE_ENVIRONMENT=Development`, which enables User Secrets loading. Use `Ctrl+C` in the terminal to stop the app.
 
 ### Troubleshooting
 
@@ -58,6 +103,9 @@ Open `https://localhost:7142` and sign in. The HTTPS launch profile sets `ASPNET
 - `AADSTS50011` means the redirect URI in Entra does not exactly match `https://localhost:7142/signin-oidc`.
 - If sign-in succeeds but the page reports access denied, check that the user is in one of the configured groups and that the token contains its object ID in the `groups` claim.
 - The GitHub settings are independently required; once Entra validation passes, missing GitHub settings can still prevent startup.
+- GitHub API failures appear in the app as a generic “Unable to update or read the GitHub runner group” message. If checking the same token with GitHub CLI, `401` usually means the token is invalid or expired; `403` points to missing **Self-hosted runners: Read and write**, missing access to a private repository, insufficient organization-owner/admin access, or a token that needs organization approval.
+- A GitHub `404` from the CLI commonly means `GitHub:Organization` is a personal username or display name instead of the organization slug, `GitHub:RunnerGroupId` does not belong to that organization, or the token cannot access the repository.
+- If the app starts but cannot load the group, check the organization slug and numeric runner-group ID. The app currently reports missing/invalid GitHub settings together in one startup validation message.
 
 ## Configuration reference
 
@@ -69,15 +117,15 @@ Open `https://localhost:7142` and sign in. The HTTPS launch profile sets `ASPNET
 | `Entra__ReadOnlyGroupId` | Entra group object ID with read-only access |
 | `Entra__OperatorGroupId` | Entra group object ID with operator access |
 | `Entra__ApiAudience` | Optional API audience; defaults to `api://<client-id>` |
-| `GitHub__Organization` | The single GitHub organization managed by this instance |
-| `GitHub__Token` | GitHub token for runner-group writes and repository metadata reads |
-| `GitHub__RunnerGroupId` | Numeric ID of the organization's shared runner group |
+| `GitHub__Organization` | Organization URL slug managed by this instance (not a personal username) |
+| `GitHub__Token` | Fine-grained PAT with organization Self-hosted runners read/write and access to repositories to manage |
+| `GitHub__RunnerGroupId` | Numeric ID of the organization's runner group; use the default group on GitHub Free |
 | `GitHub__ApiBaseUrl` | Optional GitHub API URL; defaults to `https://api.github.com/` |
 | `Runner__Label` | Stable runner label; defaults to `linux-dotnet` |
 
 `Entra:ApiAudience` only needs an explicit value when configuring API bearer-token clients; browser sign-in uses the OIDC client settings. The application's JWT validation requires tokens from the configured tenant. Do not use User Secrets for production.
 
-The group should be an organization runner group; the application replaces its selected repository IDs and sets visibility to selected repositories with public-repository access disabled whenever an operator saves the allowlist. Repository allowlist entries use `organization/repository` names and are resolved to repository IDs before the GitHub group is updated.
+The group must belong to the configured organization. Whenever an operator saves the allowlist, the application replaces its selected repository IDs and sets visibility to selected repositories with public-repository access disabled. Repository allowlist entries use `organization/repository` names and are resolved to repository IDs before the GitHub group is updated.
 
 ## Interfaces
 
