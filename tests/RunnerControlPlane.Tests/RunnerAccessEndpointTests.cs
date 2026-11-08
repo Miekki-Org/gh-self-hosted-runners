@@ -124,6 +124,24 @@ public sealed class RunnerAccessEndpointTests
         Assert.False(factory.GitHubApi.IsRestricted);
     }
 
+    [Fact]
+    public async Task FailedRepositoryUpdateDoesNotApplyRunnerGroupSettings()
+    {
+        using var factory = new RunnerControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        factory.GitHubApi.FailNextRepositoryUpdate = true;
+
+        var response = await client.PutAsJsonAsync(
+            "/api/runner-access",
+            new UpdateRunnerAccessRequest(["octo/build-a"]));
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal(["octo/initial-repo"], factory.GitHubApi.Repositories);
+        Assert.False(factory.GitHubApi.IsRestricted);
+        Assert.True(factory.GitHubApi.AllowsPublicRepositories);
+    }
+
     private sealed class RunnerControlPlaneFactory : WebApplicationFactory<Program>
     {
         public RunnerControlPlaneFactory(bool groupAllowsAllRepositories = false)
@@ -226,6 +244,8 @@ public sealed class RunnerAccessEndpointTests
 
         public bool AllowsPublicRepositories { get; private set; } = true;
 
+        public bool FailNextRepositoryUpdate { get; set; }
+
         protected override async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
@@ -280,6 +300,12 @@ public sealed class RunnerAccessEndpointTests
             if (request.Method == HttpMethod.Put
                 && path == "orgs/octo/actions/runner-groups/42/repositories")
             {
+                if (FailNextRepositoryUpdate)
+                {
+                    FailNextRepositoryUpdate = false;
+                    return new HttpResponseMessage(HttpStatusCode.InternalServerError);
+                }
+
                 using var body = await JsonDocument.ParseAsync(
                     await request.Content!.ReadAsStreamAsync(cancellationToken),
                     cancellationToken: cancellationToken);

@@ -51,7 +51,7 @@ builder.Services.AddHttpClient<IGitHubRunnerGroupClient, GitHubRunnerGroupClient
     client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
     client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.Token);
     client.DefaultRequestHeaders.UserAgent.ParseAdd("gh-self-hosted-runners-control-plane");
-    client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
+    client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2026-03-10");
 });
 
 const string requestAuthenticationScheme = "request";

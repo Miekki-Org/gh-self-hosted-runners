@@ -57,20 +57,20 @@ public sealed class GitHubRunnerGroupClient(HttpClient httpClient, IOptions<GitH
         }
 
         var runnerGroupPath = $"orgs/{_organizationPath}/actions/runner-groups/{_options.RunnerGroupId}";
-        using (var response = await httpClient.PatchAsJsonAsync(
-                   runnerGroupPath,
-                   new RunnerGroupUpdate(),
-                   cancellationToken))
-        {
-            EnsureSuccess(response, "restricting the runner group");
-        }
-
         using (var response = await httpClient.PutAsJsonAsync(
                    $"{runnerGroupPath}/repositories",
                    new SelectedRepositoryUpdate(repositoryIds),
                    cancellationToken))
         {
             EnsureSuccess(response, "setting the runner group repository allowlist");
+        }
+
+        using (var response = await httpClient.PatchAsJsonAsync(
+                   runnerGroupPath,
+                   new RunnerGroupUpdate(),
+                   cancellationToken))
+        {
+            EnsureSuccess(response, "restricting the runner group");
         }
 
         return await GetAccessAsync(cancellationToken);
