@@ -1,0 +1,42 @@
+@baseUrl = https://localhost:7142
+@accessToken = {{$processEnv ACCESS_TOKEN}}
+
+# Set ACCESS_TOKEN to an Entra bearer token accepted by the control plane.
+# The default Azure/GitHub image integrations are unconfigured, so build requests will fail until they are implemented.
+
+### Read runner-group access
+GET {{baseUrl}}/api/runner-access
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### List runner images
+GET {{baseUrl}}/api/runner-images
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### List validated images available for production runners
+GET {{baseUrl}}/api/runner-images/available
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### Request an expedited image build
+# Replace these sample pins with versions approved for your repositories.
+# @name buildImage
+POST {{baseUrl}}/api/runner-images
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "ubuntuRelease": "24.04",
+  "dotNetSdks": ["8.0.404"],
+  "packages": {
+    "curl": "8.5.0"
+  },
+  "runnerVersion": "2.331.0",
+  "expedited": true
+}
+
+### Inspect the build requested above
+GET {{baseUrl}}/api/runner-images/{{buildImage.response.body.$.version}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
