@@ -8,6 +8,8 @@ using Microsoft.AspNetCore.Authorization;
 using RunnerControlPlane.Access;
 using RunnerControlPlane.Configuration;
 using RunnerControlPlane.GitHub;
+using RunnerControlPlane.Images;
+using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -44,6 +46,10 @@ builder.Services
     .Validate(options => !string.IsNullOrWhiteSpace(options.Label), "A stable runner label must be configured.")
     .ValidateOnStart();
 
+builder.Services
+    .AddOptions<RunnerImageBuildOptions>()
+    .BindConfiguration("RunnerImageBuild");
+
 builder.Services.AddHttpClient<IGitHubRunnerGroupClient, GitHubRunnerGroupClient>((services, client) =>
 {
     var options = services.GetRequiredService<Microsoft.Extensions.Options.IOptions<GitHubOptions>>().Value;
@@ -53,6 +59,17 @@ builder.Services.AddHttpClient<IGitHubRunnerGroupClient, GitHubRunnerGroupClient
     client.DefaultRequestHeaders.UserAgent.ParseAdd("gh-self-hosted-runners-control-plane");
     client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2026-03-10");
 });
+
+builder.Services.ConfigureHttpJsonOptions(options =>
+    options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+builder.Services.AddSingleton<IRunnerImageStore, InMemoryRunnerImageStore>();
+builder.Services.AddSingleton<IRunnerImageBuilder, UnconfiguredRunnerImageBuilder>();
+builder.Services.AddSingleton<IRunnerImageValidator, UnconfiguredRunnerImageValidator>();
+builder.Services.AddSingleton<RunnerImageBuildQueue>();
+builder.Services.AddSingleton<IRunnerImageBuildQueue>(services =>
+    services.GetRequiredService<RunnerImageBuildQueue>());
+builder.Services.AddHostedService(services => services.GetRequiredService<RunnerImageBuildQueue>());
+builder.Services.AddHostedService<RunnerImageScheduleWorker>();
 
 const string requestAuthenticationScheme = "request";
 const string entraAuthenticationScheme = "entra";
@@ -269,6 +286,36 @@ app.MapPut("/api/runner-access", async (
         {
             return GitHubFailure();
         }
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapGet("/api/runner-images/available", (IRunnerImageStore images) =>
+        Results.Ok(images.ListAvailable()))
+    .RequireAuthorization(AccessPolicies.CanView);
+
+app.MapGet("/api/runner-images", (IRunnerImageStore images) =>
+        Results.Ok(images.List()))
+    .RequireAuthorization(AccessPolicies.CanView);
+
+app.MapGet("/api/runner-images/{version}", (string version, IRunnerImageStore images) =>
+    {
+        var image = images.Get(version);
+        return image is null ? Results.NotFound() : Results.Ok(image);
+    })
+    .RequireAuthorization(AccessPolicies.CanView);
+
+app.MapPost("/api/runner-images", (
+        RunnerImageBuildRequest? request,
+        IRunnerImageBuildQueue queue) =>
+    {
+        var validationError = RunnerImageRequestValidator.Validate(request);
+        if (validationError is not null)
+        {
+            return Results.BadRequest(new { error = validationError });
+        }
+
+        var image = queue.Queue(request!);
+        return Results.Accepted($"/api/runner-images/{image.Version}", image);
     })
     .RequireAuthorization(AccessPolicies.CanManage);
 
