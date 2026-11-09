@@ -112,9 +112,15 @@ public sealed class RunnerVmRecoveryService(
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            if (runnerVms.Get(id) is null)
+            var existing = runnerVms.Get(id);
+            if (existing is null)
             {
                 return null;
+            }
+
+            if (request.Status == RunnerVmStatus.Working && !existing.AcceptingJobs)
+            {
+                throw new RunnerVmNotAcceptingJobsException();
             }
 
             var updated = runnerVms.Update(id, current => current with

@@ -190,6 +190,10 @@ public sealed class RunnerVmEndpointTests
             new RunnerVmHealthCheckRequest(true, true));
         var stillUnhealthy = await client.GetFromJsonAsync<RunnerVmRecord>($"/api/runner-vms/{vm.Id}", JsonOptions);
         Assert.Equal(unhealthy.HealthFailureReason, stillUnhealthy!.HealthFailureReason);
+        var assignment = await client.PatchAsJsonAsync(
+            $"/api/runner-vms/{vm.Id}",
+            new UpdateRunnerVmStatusRequest(RunnerVmStatus.Working));
+        Assert.Equal(HttpStatusCode.Conflict, assignment.StatusCode);
 
         var finished = await client.PatchAsJsonAsync(
             $"/api/runner-vms/{vm.Id}",

@@ -526,80 +526,14 @@ app.MapPost("/api/runner-vms", (CreateRunnerVmRequest? request, IRunnerVmStore r
     })
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPatch("/api/runner-vm/{id}", async (string id, UpdateRunnerVmStatusRequest? request, IRunnerVmRecoveryService recovery, CancellationToken cancellationToken) =>
-    {
-        if (request is null)
-        {
-            return Results.BadRequest(new { error = "Provide a status update." });
-        }
-
-        if (request.IsRetired is not null)
-        {
-            return Results.BadRequest(new { error = "Use a Runner VM retirement action to change retirement state." });
-        }
-
-        try
-        {
-            var updated = await recovery.UpdateAsync(id, request, cancellationToken);
-            return updated is null ? Results.NotFound() : Results.Ok(updated);
-        }
-        catch (RunnerCapacityIntegrationException)
-        {
-            return RunnerCapacityFailure();
-        }
-    })
+app.MapPatch("/api/runner-vm/{id}", UpdateRunnerVmAsync)
+    .RequireAuthorization(AccessPolicies.CanManage);
+app.MapPatch("/api/runner-vms/{id}", UpdateRunnerVmAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPatch("/api/runner-vms/{id}", async (string id, UpdateRunnerVmStatusRequest? request, IRunnerVmRecoveryService recovery, CancellationToken cancellationToken) =>
-    {
-        if (request is null)
-        {
-            return Results.BadRequest(new { error = "Provide a status update." });
-        }
-
-        if (request.IsRetired is not null)
-        {
-            return Results.BadRequest(new { error = "Use a Runner VM retirement action to change retirement state." });
-        }
-
-        try
-        {
-            var updated = await recovery.UpdateAsync(id, request, cancellationToken);
-            return updated is null ? Results.NotFound() : Results.Ok(updated);
-        }
-        catch (RunnerCapacityIntegrationException)
-        {
-            return RunnerCapacityFailure();
-        }
-    })
+app.MapPatch("/api/runner-vm/{id}/status", UpdateRunnerVmStatusAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
-
-app.MapPatch("/api/runner-vm/{id}/status", async (string id, RunnerVmStatus status, IRunnerVmRecoveryService recovery, CancellationToken cancellationToken) =>
-    {
-        try
-        {
-            var updated = await recovery.UpdateAsync(id, new UpdateRunnerVmStatusRequest(status), cancellationToken);
-            return updated is null ? Results.NotFound() : Results.Ok(updated);
-        }
-        catch (RunnerCapacityIntegrationException)
-        {
-            return RunnerCapacityFailure();
-        }
-    })
-    .RequireAuthorization(AccessPolicies.CanManage);
-
-app.MapPatch("/api/runner-vms/{id}/status", async (string id, RunnerVmStatus status, IRunnerVmRecoveryService recovery, CancellationToken cancellationToken) =>
-    {
-        try
-        {
-            var updated = await recovery.UpdateAsync(id, new UpdateRunnerVmStatusRequest(status), cancellationToken);
-            return updated is null ? Results.NotFound() : Results.Ok(updated);
-        }
-        catch (RunnerCapacityIntegrationException)
-        {
-            return RunnerCapacityFailure();
-        }
-    })
+app.MapPatch("/api/runner-vms/{id}/status", UpdateRunnerVmStatusAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
 
 app.MapPost("/api/runner-vm/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null, string? actor = null, ClaimsPrincipal user = null!) =>
@@ -657,6 +591,50 @@ app.MapPost("/api/runner-vms/{id}/force-remove", async (
     .RequireAuthorization(AccessPolicies.CanManage);
 
 app.Run();
+
+static async Task<IResult> UpdateRunnerVmAsync(
+    string id,
+    UpdateRunnerVmStatusRequest? request,
+    IRunnerVmRecoveryService recovery,
+    CancellationToken cancellationToken)
+{
+    if (request is null)
+    {
+        return Results.BadRequest(new { error = "Provide a status update." });
+    }
+
+    if (request.IsRetired is not null)
+    {
+        return Results.BadRequest(new { error = "Use a Runner VM retirement action to change retirement state." });
+    }
+
+    try
+    {
+        var updated = await recovery.UpdateAsync(id, request, cancellationToken);
+        return updated is null ? Results.NotFound() : Results.Ok(updated);
+    }
+    catch (RunnerVmNotAcceptingJobsException)
+    {
+        return Results.Conflict(new { error = "The Runner VM is not accepting new work." });
+    }
+    catch (RunnerCapacityIntegrationException)
+    {
+        return RunnerCapacityFailure();
+    }
+}
+
+static Task<IResult> UpdateRunnerVmStatusAsync(
+    string id,
+    RunnerVmStatus status,
+    IRunnerVmRecoveryService recovery,
+    CancellationToken cancellationToken)
+{
+    return UpdateRunnerVmAsync(
+        id,
+        new UpdateRunnerVmStatusRequest(status),
+        recovery,
+        cancellationToken);
+}
 
 static string? GetRequestedImageVersion(CreateRunnerVmRequest? request, IRunnerImageStore images)
 {

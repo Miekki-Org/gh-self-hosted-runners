@@ -25,7 +25,7 @@ public sealed class RunnerVmCleanupService(
         var minimumCapacity = options.Value.MinimumCapacity;
         var gracePeriod = TimeSpan.FromSeconds(Math.Max(0, options.Value.IdleGracePeriodSeconds));
         var idleVms = runnerVms.List()
-            .Where(vm => vm.Status == RunnerVmStatus.Idle && !vm.IsRetired && !vm.IsUnhealthy)
+            .Where(IsEligibleForAutomaticCleanup)
             .Where(vm => vm.UpdatedAt is not null && vm.UpdatedAt.Value.Add(gracePeriod) <= now)
             .OrderBy(vm => vm.UpdatedAt ?? DateTimeOffset.MinValue)
             .ToArray();
@@ -36,8 +36,7 @@ public sealed class RunnerVmCleanupService(
         }
 
         var retired = 0;
-        var eligibleIdleCount = runnerVms.List()
-            .Count(vm => vm.Status == RunnerVmStatus.Idle && !vm.IsRetired && !vm.IsUnhealthy);
+        var eligibleIdleCount = runnerVms.List().Count(IsEligibleForAutomaticCleanup);
         foreach (var vm in idleVms)
         {
             if (eligibleIdleCount <= minimumCapacity)
@@ -51,6 +50,11 @@ public sealed class RunnerVmCleanupService(
         }
 
         return Task.FromResult(retired);
+    }
+
+    private static bool IsEligibleForAutomaticCleanup(RunnerVmRecord vm)
+    {
+        return vm.Status == RunnerVmStatus.Idle && !vm.IsRetired && !vm.IsUnhealthy;
     }
 }
 

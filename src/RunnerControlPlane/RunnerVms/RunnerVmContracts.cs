@@ -100,6 +100,9 @@ public sealed record RunnerVmHealthCheckRequest(
     string? VmHealthFailureReason = null,
     string? RunnerConnectivityFailureReason = null);
 
+public sealed class RunnerVmNotAcceptingJobsException()
+    : Exception("Runner VM is not accepting new work.");
+
 public sealed record RunnerVmAuditRecord(
     string Actor,
     DateTimeOffset Timestamp,
