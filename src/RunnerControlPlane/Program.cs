@@ -351,6 +351,7 @@ app.MapPost("/api/runner-vm", (CreateRunnerVmRequest? request, IRunnerVmStore ru
         return Results.Accepted($"/api/runner-vms/{vm.Id}", vm);
     })
     .RequireAuthorization(AccessPolicies.CanManage);
+
 app.MapPost("/api/runner-vms", (CreateRunnerVmRequest? request, IRunnerVmStore runnerVms, IRunnerImageStore images, IOptions<RunnerOptions> runnerOptions) =>
     {
         var selectedImage = GetRequestedImageVersion(request, images);
@@ -390,6 +391,7 @@ app.MapPatch("/api/runner-vm/{id}", (string id, UpdateRunnerVmStatusRequest? req
         return Results.Ok(updated);
     })
     .RequireAuthorization(AccessPolicies.CanManage);
+
 app.MapPatch("/api/runner-vms/{id}", (string id, UpdateRunnerVmStatusRequest? request, IRunnerVmStore runnerVms) =>
     {
         if (request is null)
@@ -416,6 +418,7 @@ app.MapPatch("/api/runner-vms/{id}", (string id, UpdateRunnerVmStatusRequest? re
         return Results.Ok(updated);
     })
     .RequireAuthorization(AccessPolicies.CanManage);
+
 app.MapPatch("/api/runner-vm/{id}/status", (string id, RunnerVmStatus status, IRunnerVmStore runnerVms) =>
     {
         var vm = runnerVms.Get(id);
@@ -433,6 +436,7 @@ app.MapPatch("/api/runner-vm/{id}/status", (string id, RunnerVmStatus status, IR
         return Results.Ok(updated);
     })
     .RequireAuthorization(AccessPolicies.CanManage);
+
 app.MapPatch("/api/runner-vms/{id}/status", (string id, RunnerVmStatus status, IRunnerVmStore runnerVms) =>
     {
         var vm = runnerVms.Get(id);
@@ -450,6 +454,7 @@ app.MapPatch("/api/runner-vms/{id}/status", (string id, RunnerVmStatus status, I
         return Results.Ok(updated);
     })
     .RequireAuthorization(AccessPolicies.CanManage);
+
 app.MapPost("/api/runner-vm/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null) =>
     {
         var vm = runnerVms.Get(id);
@@ -462,6 +467,7 @@ app.MapPost("/api/runner-vm/{id}/retire", (string id, IRunnerVmStore runnerVms, 
         return Results.Ok(completed);
     })
     .RequireAuthorization(AccessPolicies.CanManage);
+
 app.MapPost("/api/runner-vms/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null) =>
     {
         var vm = runnerVms.Get(id);

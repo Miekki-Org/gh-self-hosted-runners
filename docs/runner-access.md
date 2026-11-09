@@ -136,3 +136,13 @@ The group must belong to the configured organization. Whenever an operator saves
 - `/` is the authenticated website. It hides the editor for read-only users and submits changes to the same API endpoint. `/login` starts Entra sign-in.
 
 API requests without valid authentication receive `401`; authenticated users outside both configured groups receive `403`. Read-only users receive `403` for allowlist updates. The group membership checks use the `groups` claim; configure Entra to emit that claim for users accessing this application.
+
+
+## Get the ACCESS TOKEN
+```
+export ACCESS_TOKEN="$(az account get-access-token \
+  --tenant "$TENANT_ID" \
+  --scope "api://$CLIENT_ID/.default" \
+  --query accessToken -o tsv)"
+code .
+```
