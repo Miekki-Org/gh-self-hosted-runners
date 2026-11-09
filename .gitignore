@@ -2,3 +2,4 @@
 **/obj/
 TestResults/
 .vs/
+src/RunnerControlPlane/data/runner-capacity-state.json
