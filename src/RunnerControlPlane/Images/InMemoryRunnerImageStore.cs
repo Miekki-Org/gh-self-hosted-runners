@@ -43,6 +43,16 @@ public sealed class InMemoryRunnerImageStore : IRunnerImageStore
         return image;
     }
 
+    public RunnerImage Add(RunnerImage image)
+    {
+        if (!_images.TryAdd(image.Version, image))
+        {
+            throw new InvalidOperationException($"Runner image version '{image.Version}' already exists.");
+        }
+
+        return image;
+    }
+
     public void Update(string version, Func<RunnerImage, RunnerImage> update)
     {
         _images.AddOrUpdate(
