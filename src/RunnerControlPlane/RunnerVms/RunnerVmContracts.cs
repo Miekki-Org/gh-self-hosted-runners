@@ -75,6 +75,8 @@ public sealed record RunnerVmRecord(
 
     public bool Retired => IsRetired;
 
+    public bool IsIdle => Status == RunnerVmStatus.Idle && !IsRetired;
+
     public string? RunnerLabel => Label;
 }
 
@@ -85,6 +87,12 @@ public sealed record UpdateRunnerVmStatusRequest(
     bool? RetryScheduled = null,
     bool? IsRetired = null);
 
+public sealed record RunnerVmAuditRecord(
+    string Actor,
+    DateTimeOffset Timestamp,
+    string Action,
+    string Outcome);
+
 public interface IRunnerVmStore
 {
     IReadOnlyList<RunnerVmRecord> List();
@@ -92,4 +100,6 @@ public interface IRunnerVmStore
     RunnerVmRecord Create(string? imageVersion, string label, string runnerGroup);
     RunnerVmRecord Update(string id, Func<RunnerVmRecord, RunnerVmRecord> update);
     RunnerVmRecord Retire(string id, string outcome, string? message = null);
+    RunnerVmRecord Retire(string id, string outcome, string actor, string? message, string action);
+    IReadOnlyList<RunnerVmAuditRecord> GetAuditTrail();
 }

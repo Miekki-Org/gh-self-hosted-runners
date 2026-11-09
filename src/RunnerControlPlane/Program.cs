@@ -60,6 +60,9 @@ builder.Services
     .Validate(
         options => options.ReconcileIntervalSeconds > 0,
         "RunnerCapacity:ReconcileIntervalSeconds must be greater than zero.")
+    .Validate(
+        options => options.IdleGracePeriodSeconds >= 0,
+        "RunnerCapacity:IdleGracePeriodSeconds must be zero or greater.")
     .ValidateOnStart();
 
 builder.Services
@@ -101,6 +104,8 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<IRunnerImageStore, InMemoryRunnerImageStore>();
 builder.Services.AddSingleton<IRunnerVmStore, InMemoryRunnerVmStore>();
+builder.Services.AddSingleton<IRunnerVmCleanupService, RunnerVmCleanupService>();
+builder.Services.AddHostedService<RunnerVmCleanupWorker>();
 if (builder.Configuration.GetValue<bool>("AzureVmScaleSet:Enabled"))
 {
     builder.Services.AddSingleton<IAzureVmScaleSetClient, AzureVmScaleSetClient>();
@@ -452,6 +457,10 @@ app.MapGet("/api/runner-vm/{id}", (string id, IRunnerVmStore runnerVms) =>
         return vm is null ? Results.NotFound() : Results.Ok(vm);
     })
     .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-vm/audit", (IRunnerVmStore runnerVms) => Results.Ok(runnerVms.GetAuditTrail()))
+    .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-vms/audit", (IRunnerVmStore runnerVms) => Results.Ok(runnerVms.GetAuditTrail()))
+    .RequireAuthorization(AccessPolicies.CanView);
 app.MapGet("/api/runner-vms/{id}", (string id, IRunnerVmStore runnerVms) =>
     {
         var vm = runnerVms.Get(id);
@@ -575,7 +584,7 @@ app.MapPatch("/api/runner-vms/{id}/status", (string id, RunnerVmStatus status, I
     })
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPost("/api/runner-vm/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null) =>
+app.MapPost("/api/runner-vm/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null, string? actor = null, ClaimsPrincipal user = null!) =>
     {
         var vm = runnerVms.Get(id);
         if (vm is null)
@@ -583,12 +592,17 @@ app.MapPost("/api/runner-vm/{id}/retire", (string id, IRunnerVmStore runnerVms, 
             return Results.NotFound();
         }
 
-        var completed = runnerVms.Retire(id, outcome ?? "Success", error);
+        if (vm.Status != RunnerVmStatus.Idle)
+        {
+            return Results.Conflict(new { error = "Only idle Runner VMs can be retired manually." });
+        }
+
+        var completed = runnerVms.Retire(id, outcome ?? "Success", string.IsNullOrWhiteSpace(actor) ? GetActor(user) : actor, error, "manual-retire");
         return Results.Ok(completed);
     })
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPost("/api/runner-vms/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null) =>
+app.MapPost("/api/runner-vms/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null, string? actor = null, ClaimsPrincipal user = null!) =>
     {
         var vm = runnerVms.Get(id);
         if (vm is null)
@@ -596,7 +610,12 @@ app.MapPost("/api/runner-vms/{id}/retire", (string id, IRunnerVmStore runnerVms,
             return Results.NotFound();
         }
 
-        var completed = runnerVms.Retire(id, outcome ?? "Success", error);
+        if (vm.Status != RunnerVmStatus.Idle)
+        {
+            return Results.Conflict(new { error = "Only idle Runner VMs can be retired manually." });
+        }
+
+        var completed = runnerVms.Retire(id, outcome ?? "Success", string.IsNullOrWhiteSpace(actor) ? GetActor(user) : actor, error, "manual-retire");
         return Results.Ok(completed);
     })
     .RequireAuthorization(AccessPolicies.CanManage);

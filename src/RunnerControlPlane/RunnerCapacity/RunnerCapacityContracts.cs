@@ -8,6 +8,8 @@ public sealed class RunnerCapacityOptions
 
     public int ReconcileIntervalSeconds { get; set; } = 30;
 
+    public int IdleGracePeriodSeconds { get; set; } = 300;
+
     public string StateFilePath { get; set; } = "";
 }
 
