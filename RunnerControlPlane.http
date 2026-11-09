@@ -2,7 +2,7 @@
 @accessToken = {{$processEnv ACCESS_TOKEN}}
 
 # Set ACCESS_TOKEN to an Entra bearer token accepted by the control plane.
-# The default Azure/GitHub image integrations are unconfigured, so build requests will fail until they are implemented.
+# Configure AzureVmScaleSet before enabling live VM Scale Set changes. Image build integrations remain unconfigured.
 
 ### Read runner-group access
 GET {{baseUrl}}/api/runner-access
@@ -23,6 +23,35 @@ Accept: application/json
 GET {{baseUrl}}/api/runner-vms
 Authorization: Bearer {{accessToken}}
 Accept: application/json
+
+### View runner capacity and queued demand
+GET {{baseUrl}}/api/runner-capacity
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### View capacity change audit records
+GET {{baseUrl}}/api/runner-capacity/audit
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### Update capacity settings (operators only)
+PUT {{baseUrl}}/api/runner-capacity/settings
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "minimumCapacity": 0,
+  "maximumCapacity": 10
+}
+
+### Request one-off scale-out (operators only; capped at maximum)
+POST {{baseUrl}}/api/runner-capacity/scale-out
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "count": 2
+}
 
 ### Request an expedited image build
 # Replace these sample pins with versions approved for your repositories.

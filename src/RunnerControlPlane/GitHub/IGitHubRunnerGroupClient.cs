@@ -15,7 +15,9 @@ public sealed record RunnerGroupAccess(
     string Organization,
     string Name,
     bool IsRestricted,
-    IReadOnlyList<string> Repositories);
+    IReadOnlyList<string> Repositories,
+    bool AllowsPublicRepositories = false,
+    bool AllowsAllRepositories = false);
 
 public sealed class InvalidRepositoryOrganizationException()
     : Exception("Repository is not in the configured organization.");

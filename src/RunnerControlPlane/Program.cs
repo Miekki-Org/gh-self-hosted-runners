@@ -9,6 +9,7 @@ using RunnerControlPlane.Access;
 using RunnerControlPlane.Configuration;
 using RunnerControlPlane.GitHub;
 using RunnerControlPlane.Images;
+using RunnerControlPlane.RunnerCapacity;
 using RunnerControlPlane.RunnerVms;
 using Microsoft.Extensions.Options;
 using System.Text.Json.Serialization;
@@ -49,6 +50,30 @@ builder.Services
     .ValidateOnStart();
 
 builder.Services
+    .AddOptions<RunnerCapacityOptions>()
+    .BindConfiguration("RunnerCapacity")
+    .Validate(options => options.MinimumCapacity >= 0, "RunnerCapacity:MinimumCapacity must be at least zero.")
+    .Validate(options => options.MaximumCapacity > 0, "RunnerCapacity:MaximumCapacity must be greater than zero.")
+    .Validate(
+        options => options.MinimumCapacity <= options.MaximumCapacity,
+        "RunnerCapacity:MinimumCapacity must not exceed RunnerCapacity:MaximumCapacity.")
+    .Validate(
+        options => options.ReconcileIntervalSeconds > 0,
+        "RunnerCapacity:ReconcileIntervalSeconds must be greater than zero.")
+    .ValidateOnStart();
+
+builder.Services
+    .AddOptions<AzureVmScaleSetOptions>()
+    .BindConfiguration("AzureVmScaleSet")
+    .Validate(
+        options => !options.Enabled
+            || (Guid.TryParse(options.SubscriptionId, out _)
+                && !string.IsNullOrWhiteSpace(options.ResourceGroupName)
+                && !string.IsNullOrWhiteSpace(options.ScaleSetName)),
+        "Azure VM Scale Set subscription, resource group, and scale set names are required when enabled.")
+    .ValidateOnStart();
+
+builder.Services
     .AddOptions<RunnerImageBuildOptions>()
     .BindConfiguration("RunnerImageBuild");
 
@@ -62,10 +87,31 @@ builder.Services.AddHttpClient<IGitHubRunnerGroupClient, GitHubRunnerGroupClient
     client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2026-03-10");
 });
 
+builder.Services.AddHttpClient<IGitHubRunnerCapacityClient, GitHubRunnerCapacityClient>((services, client) =>
+{
+    var options = services.GetRequiredService<Microsoft.Extensions.Options.IOptions<GitHubOptions>>().Value;
+    client.BaseAddress = new Uri(options.ApiBaseUrl.EndsWith('/') ? options.ApiBaseUrl : $"{options.ApiBaseUrl}/");
+    client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.Token);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("gh-self-hosted-runners-control-plane");
+    client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2026-03-10");
+});
+
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<IRunnerImageStore, InMemoryRunnerImageStore>();
 builder.Services.AddSingleton<IRunnerVmStore, InMemoryRunnerVmStore>();
+if (builder.Configuration.GetValue<bool>("AzureVmScaleSet:Enabled"))
+{
+    builder.Services.AddSingleton<IAzureVmScaleSetClient, AzureVmScaleSetClient>();
+}
+else
+{
+    builder.Services.AddSingleton<IAzureVmScaleSetClient, InMemoryAzureVmScaleSetClient>();
+}
+builder.Services.AddSingleton<IRunnerCapacityStateStore, JsonRunnerCapacityStateStore>();
+builder.Services.AddSingleton<IRunnerCapacityController, RunnerCapacityController>();
+builder.Services.AddHostedService<RunnerCapacityReconcileWorker>();
 builder.Services.AddSingleton<IRunnerImageBuilder, UnconfiguredRunnerImageBuilder>();
 builder.Services.AddSingleton<IRunnerImageValidator, UnconfiguredRunnerImageValidator>();
 builder.Services.AddSingleton<RunnerImageBuildQueue>();
@@ -296,6 +342,80 @@ app.MapGet("/api/runner-images/available", (IRunnerImageStore images) =>
         Results.Ok(images.ListAvailable()))
     .RequireAuthorization(AccessPolicies.CanView);
 
+app.MapGet("/api/runner-capacity", async (
+        IRunnerCapacityController capacity,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            return Results.Ok(await capacity.GetSnapshotAsync(cancellationToken));
+        }
+        catch (RunnerCapacityIntegrationException)
+        {
+            return RunnerCapacityFailure();
+        }
+    })
+    .RequireAuthorization(AccessPolicies.CanView);
+
+app.MapGet("/api/runner-capacity/audit", (IRunnerCapacityController capacity) =>
+        Results.Ok(capacity.GetAuditTrail()))
+    .RequireAuthorization(AccessPolicies.CanView);
+
+app.MapPut("/api/runner-capacity/settings", async (
+        UpdateCapacitySettingsRequest? request,
+        ClaimsPrincipal user,
+        IRunnerCapacityController capacity,
+        CancellationToken cancellationToken) =>
+    {
+        if (request is null
+            || request.MinimumCapacity < 0
+            || request.MaximumCapacity < 1
+            || request.MinimumCapacity > request.MaximumCapacity)
+        {
+            return Results.BadRequest(new { error = "Provide a minimum of zero or greater and a maximum greater than or equal to the minimum." });
+        }
+
+        try
+        {
+            var updated = await capacity.UpdateSettingsAsync(
+                request.MinimumCapacity,
+                request.MaximumCapacity,
+                GetActor(user),
+                cancellationToken);
+            return Results.Ok(updated);
+        }
+        catch (RunnerCapacityIntegrationException)
+        {
+            return RunnerCapacityFailure();
+        }
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPost("/api/runner-capacity/scale-out", async (
+        ScaleOutRequest? request,
+        ClaimsPrincipal user,
+        IRunnerCapacityController capacity,
+        CancellationToken cancellationToken) =>
+    {
+        if (request is null || request.Count < 1)
+        {
+            return Results.BadRequest(new { error = "Request at least one Runner VM." });
+        }
+
+        try
+        {
+            return Results.Ok(await capacity.RequestScaleOutAsync(
+                request.Count,
+                GetActor(user),
+                cancellationToken));
+        }
+        catch (RunnerCapacityIntegrationException)
+        {
+            return RunnerCapacityFailure();
+        }
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
 app.MapGet("/api/runner-images", (IRunnerImageStore images) =>
         Results.Ok(images.List()))
     .RequireAuthorization(AccessPolicies.CanView);
@@ -493,6 +613,16 @@ static string? GetRequestedImageVersion(CreateRunnerVmRequest? request, IRunnerI
     return images.ListAvailable().FirstOrDefault()?.Version;
 }
 
+static string GetActor(ClaimsPrincipal user)
+{
+    return user.Identity?.Name
+        ?? user.FindFirst("name")?.Value
+        ?? user.FindFirst("preferred_username")?.Value
+        ?? user.FindFirst("oid")?.Value
+        ?? user.FindFirst("sub")?.Value
+        ?? "unknown";
+}
+
 static bool HasGroup(ClaimsPrincipal user, string groupId)
 {
     return !string.IsNullOrWhiteSpace(groupId)
@@ -553,6 +683,13 @@ static IResult GitHubFailure()
     return Results.Problem(
         statusCode: StatusCodes.Status502BadGateway,
         title: "Unable to update or read the GitHub runner group.");
+}
+
+static IResult RunnerCapacityFailure()
+{
+    return Results.Problem(
+        statusCode: StatusCodes.Status502BadGateway,
+        title: "Unable to read or change runner capacity.");
 }
 
 public partial class Program;

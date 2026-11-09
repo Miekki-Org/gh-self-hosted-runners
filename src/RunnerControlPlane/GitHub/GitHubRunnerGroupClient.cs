@@ -21,7 +21,13 @@ public sealed class GitHubRunnerGroupClient(HttpClient httpClient, IOptions<GitH
         var restricted = group.Visibility.Equals("selected", StringComparison.OrdinalIgnoreCase)
             && !group.AllowsPublicRepositories;
 
-        return new RunnerGroupAccess(_options.Organization, group.Name, restricted, selected);
+        return new RunnerGroupAccess(
+            _options.Organization,
+            group.Name,
+            restricted,
+            selected,
+            group.AllowsPublicRepositories,
+            group.Visibility.Equals("all", StringComparison.OrdinalIgnoreCase));
     }
 
     public async Task<RunnerGroupAccess> SetRepositoriesAsync(

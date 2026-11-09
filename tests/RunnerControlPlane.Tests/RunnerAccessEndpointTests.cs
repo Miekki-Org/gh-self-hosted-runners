@@ -14,6 +14,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RunnerControlPlane.Access;
 using RunnerControlPlane.GitHub;
+using RunnerControlPlane.RunnerCapacity;
 
 namespace RunnerControlPlane.Tests;
 
@@ -245,6 +246,8 @@ public sealed class RunnerAccessEndpointTests
 
             builder.ConfigureTestServices(services =>
             {
+                services.RemoveAll<IGitHubRunnerCapacityClient>();
+                services.AddSingleton<IGitHubRunnerCapacityClient, TestGitHubRunnerCapacityClient>();
                 services.RemoveAll<IGitHubRunnerGroupClient>();
                 services.AddHttpClient<IGitHubRunnerGroupClient, GitHubRunnerGroupClient>()
                     .ConfigureHttpClient(client => client.BaseAddress = new Uri("https://api.github.test/"))
