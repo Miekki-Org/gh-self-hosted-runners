@@ -73,6 +73,7 @@ public sealed class InMemoryRunnerVmStore : IRunnerVmStore
             Outcome = normalizedOutcome,
             IsRetired = true,
             RetryScheduled = false,
+            AcceptingJobs = false,
             FailureReason = message,
             UpdatedAt = DateTimeOffset.UtcNow
         };

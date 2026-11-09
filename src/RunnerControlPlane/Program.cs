@@ -66,6 +66,14 @@ builder.Services
     .ValidateOnStart();
 
 builder.Services
+    .AddOptions<RunnerVmOptions>()
+    .BindConfiguration("RunnerVm")
+    .Validate(
+        options => options.HealthFailureThreshold >= 2,
+        "RunnerVm:HealthFailureThreshold must be at least two.")
+    .ValidateOnStart();
+
+builder.Services
     .AddOptions<AzureVmScaleSetOptions>()
     .BindConfiguration("AzureVmScaleSet")
     .Validate(
@@ -104,6 +112,7 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<IRunnerImageStore, InMemoryRunnerImageStore>();
 builder.Services.AddSingleton<IRunnerVmStore, InMemoryRunnerVmStore>();
+builder.Services.AddSingleton<IRunnerVmRecoveryService, RunnerVmRecoveryService>();
 builder.Services.AddSingleton<IRunnerVmCleanupService, RunnerVmCleanupService>();
 builder.Services.AddHostedService<RunnerVmCleanupWorker>();
 if (builder.Configuration.GetValue<bool>("AzureVmScaleSet:Enabled"))
@@ -468,6 +477,29 @@ app.MapGet("/api/runner-vms/{id}", (string id, IRunnerVmStore runnerVms) =>
     })
     .RequireAuthorization(AccessPolicies.CanView);
 
+app.MapPost("/api/runner-vms/{id}/health-checks", async (
+        string id,
+        RunnerVmHealthCheckRequest? request,
+        IRunnerVmRecoveryService recovery,
+        CancellationToken cancellationToken) =>
+    {
+        if (request is null)
+        {
+            return Results.BadRequest(new { error = "Provide VM-health and runner-connectivity results." });
+        }
+
+        try
+        {
+            var vm = await recovery.RecordHealthCheckAsync(id, request, cancellationToken);
+            return vm is null ? Results.NotFound() : Results.Ok(vm);
+        }
+        catch (RunnerCapacityIntegrationException)
+        {
+            return RunnerCapacityFailure();
+        }
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
 app.MapPost("/api/runner-vm", (CreateRunnerVmRequest? request, IRunnerVmStore runnerVms, IRunnerImageStore images, IOptions<RunnerOptions> runnerOptions) =>
     {
         var selectedImage = GetRequestedImageVersion(request, images);
@@ -494,94 +526,14 @@ app.MapPost("/api/runner-vms", (CreateRunnerVmRequest? request, IRunnerVmStore r
     })
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPatch("/api/runner-vm/{id}", (string id, UpdateRunnerVmStatusRequest? request, IRunnerVmStore runnerVms) =>
-    {
-        if (request is null)
-        {
-            return Results.BadRequest(new { error = "Provide a status update." });
-        }
-
-        var vm = runnerVms.Get(id);
-        if (vm is null)
-        {
-            return Results.NotFound();
-        }
-
-        var updated = runnerVms.Update(id, current => current with
-        {
-            Status = request.Status,
-            JobStatus = request.Status.ToString().ToLowerInvariant(),
-            Outcome = request.Outcome ?? current.Outcome,
-            FailureReason = request.Error ?? current.FailureReason,
-            IsRetired = request.IsRetired ?? current.IsRetired,
-            RetryScheduled = request.RetryScheduled ?? current.RetryScheduled,
-            UpdatedAt = DateTimeOffset.UtcNow
-        });
-        return Results.Ok(updated);
-    })
+app.MapPatch("/api/runner-vm/{id}", UpdateRunnerVmAsync)
+    .RequireAuthorization(AccessPolicies.CanManage);
+app.MapPatch("/api/runner-vms/{id}", UpdateRunnerVmAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPatch("/api/runner-vms/{id}", (string id, UpdateRunnerVmStatusRequest? request, IRunnerVmStore runnerVms) =>
-    {
-        if (request is null)
-        {
-            return Results.BadRequest(new { error = "Provide a status update." });
-        }
-
-        var vm = runnerVms.Get(id);
-        if (vm is null)
-        {
-            return Results.NotFound();
-        }
-
-        var updated = runnerVms.Update(id, current => current with
-        {
-            Status = request.Status,
-            JobStatus = request.Status.ToString().ToLowerInvariant(),
-            Outcome = request.Outcome ?? current.Outcome,
-            FailureReason = request.Error ?? current.FailureReason,
-            IsRetired = request.IsRetired ?? current.IsRetired,
-            RetryScheduled = request.RetryScheduled ?? current.RetryScheduled,
-            UpdatedAt = DateTimeOffset.UtcNow
-        });
-        return Results.Ok(updated);
-    })
+app.MapPatch("/api/runner-vm/{id}/status", UpdateRunnerVmStatusAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
-
-app.MapPatch("/api/runner-vm/{id}/status", (string id, RunnerVmStatus status, IRunnerVmStore runnerVms) =>
-    {
-        var vm = runnerVms.Get(id);
-        if (vm is null)
-        {
-            return Results.NotFound();
-        }
-
-        var updated = runnerVms.Update(id, current => current with
-        {
-            Status = status,
-            JobStatus = status.ToString().ToLowerInvariant(),
-            UpdatedAt = DateTimeOffset.UtcNow
-        });
-        return Results.Ok(updated);
-    })
-    .RequireAuthorization(AccessPolicies.CanManage);
-
-app.MapPatch("/api/runner-vms/{id}/status", (string id, RunnerVmStatus status, IRunnerVmStore runnerVms) =>
-    {
-        var vm = runnerVms.Get(id);
-        if (vm is null)
-        {
-            return Results.NotFound();
-        }
-
-        var updated = runnerVms.Update(id, current => current with
-        {
-            Status = status,
-            JobStatus = status.ToString().ToLowerInvariant(),
-            UpdatedAt = DateTimeOffset.UtcNow
-        });
-        return Results.Ok(updated);
-    })
+app.MapPatch("/api/runner-vms/{id}/status", UpdateRunnerVmStatusAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
 
 app.MapPost("/api/runner-vm/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null, string? actor = null, ClaimsPrincipal user = null!) =>
@@ -620,7 +572,69 @@ app.MapPost("/api/runner-vms/{id}/retire", (string id, IRunnerVmStore runnerVms,
     })
     .RequireAuthorization(AccessPolicies.CanManage);
 
+app.MapPost("/api/runner-vms/{id}/force-remove", async (
+        string id,
+        ClaimsPrincipal user,
+        IRunnerVmRecoveryService recovery,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            var vm = await recovery.ForceRemoveAsync(id, GetActor(user), cancellationToken);
+            return vm is null ? Results.NotFound() : Results.Ok(vm);
+        }
+        catch (RunnerCapacityIntegrationException)
+        {
+            return RunnerCapacityFailure();
+        }
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
 app.Run();
+
+static async Task<IResult> UpdateRunnerVmAsync(
+    string id,
+    UpdateRunnerVmStatusRequest? request,
+    IRunnerVmRecoveryService recovery,
+    CancellationToken cancellationToken)
+{
+    if (request is null)
+    {
+        return Results.BadRequest(new { error = "Provide a status update." });
+    }
+
+    if (request.IsRetired is not null)
+    {
+        return Results.BadRequest(new { error = "Use a Runner VM retirement action to change retirement state." });
+    }
+
+    try
+    {
+        var updated = await recovery.UpdateAsync(id, request, cancellationToken);
+        return updated is null ? Results.NotFound() : Results.Ok(updated);
+    }
+    catch (RunnerVmNotAcceptingJobsException)
+    {
+        return Results.Conflict(new { error = "The Runner VM is not accepting new work." });
+    }
+    catch (RunnerCapacityIntegrationException)
+    {
+        return RunnerCapacityFailure();
+    }
+}
+
+static Task<IResult> UpdateRunnerVmStatusAsync(
+    string id,
+    RunnerVmStatus status,
+    IRunnerVmRecoveryService recovery,
+    CancellationToken cancellationToken)
+{
+    return UpdateRunnerVmAsync(
+        id,
+        new UpdateRunnerVmStatusRequest(status),
+        recovery,
+        cancellationToken);
+}
 
 static string? GetRequestedImageVersion(CreateRunnerVmRequest? request, IRunnerImageStore images)
 {
