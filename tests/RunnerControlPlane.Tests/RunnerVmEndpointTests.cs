@@ -92,7 +92,63 @@ public sealed class RunnerVmEndpointTests
         Assert.False(cancelledRecord.RetryScheduled);
     }
 
-    private sealed class RunnerVmControlPlaneFactory : WebApplicationFactory<Program>
+    [Fact]
+    public async Task SystemRetiresIdleVmAfterGracePeriodWhileKeepingWarmPoolMinimum()
+    {
+        using var factory = new RunnerVmControlPlaneFactory(
+            minimumCapacity: 1,
+            idleGracePeriodSeconds: 0,
+            reconcileIntervalSeconds: 1);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var first = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("24.04"));
+        var second = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("24.04"));
+        var firstVm = await first.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+        var secondVm = await second.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+
+        var store = factory.Services.GetRequiredService<IRunnerVmStore>();
+        store.Update(firstVm!.Id, current => current with { UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-10) });
+        store.Update(secondVm!.Id, current => current with { UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-10) });
+
+        var cleanup = factory.Services.GetRequiredService<IRunnerVmCleanupService>();
+        var retired = await cleanup.RetireIdleVmsAsync();
+        var audit = await client.GetFromJsonAsync<RunnerVmAuditRecord[]>($"/api/runner-vms/audit", JsonOptions);
+
+        Assert.Equal(1, retired);
+        Assert.Equal(1, audit!.Length);
+        Assert.Equal("system", audit[0].Actor);
+        Assert.Equal("automatic-idle-retire", audit[0].Action);
+        Assert.Contains("retired", audit[0].Outcome, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task OperatorCanManuallyRetireIdleVmEvenWhenItDropsBelowMinimum()
+    {
+        using var factory = new RunnerVmControlPlaneFactory(minimumCapacity: 2, idleGracePeriodSeconds: 600);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var created = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("24.04"));
+        var vm = await created.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+        var retirement = await client.PostAsync($"/api/runner-vms/{vm!.Id}/retire?outcome=Success&actor=operator", null);
+        var record = await retirement.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+        var audit = await client.GetFromJsonAsync<RunnerVmAuditRecord[]>($"/api/runner-vms/audit", JsonOptions);
+
+        Assert.Equal(HttpStatusCode.OK, retirement.StatusCode);
+        Assert.Equal(RunnerVmStatus.Finished, record!.Status);
+        Assert.True(record.IsRetired);
+        Assert.Equal("Success", record.Outcome);
+        Assert.Single(audit!);
+        Assert.Equal("operator", audit[0].Actor);
+        Assert.Equal("manual-retire", audit[0].Action);
+        Assert.Equal("succeeded", audit[0].Outcome);
+    }
+
+    private sealed class RunnerVmControlPlaneFactory(
+        int minimumCapacity = 1,
+        int idleGracePeriodSeconds = 300,
+        int reconcileIntervalSeconds = 3600) : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -109,7 +165,10 @@ public sealed class RunnerVmEndpointTests
                     ["GitHub:Organization"] = "octo",
                     ["GitHub:Token"] = "test-token",
                     ["GitHub:RunnerGroupId"] = "42",
-                    ["Runner:Label"] = "linux-dotnet"
+                    ["Runner:Label"] = "linux-dotnet",
+                    ["RunnerCapacity:MinimumCapacity"] = minimumCapacity.ToString(),
+                    ["RunnerCapacity:IdleGracePeriodSeconds"] = idleGracePeriodSeconds.ToString(),
+                    ["RunnerCapacity:ReconcileIntervalSeconds"] = reconcileIntervalSeconds.ToString()
                 });
             });
 
