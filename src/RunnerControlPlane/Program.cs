@@ -9,6 +9,8 @@ using RunnerControlPlane.Access;
 using RunnerControlPlane.Configuration;
 using RunnerControlPlane.GitHub;
 using RunnerControlPlane.Images;
+using RunnerControlPlane.RunnerVms;
+using Microsoft.Extensions.Options;
 using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -63,6 +65,7 @@ builder.Services.AddHttpClient<IGitHubRunnerGroupClient, GitHubRunnerGroupClient
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<IRunnerImageStore, InMemoryRunnerImageStore>();
+builder.Services.AddSingleton<IRunnerVmStore, InMemoryRunnerVmStore>();
 builder.Services.AddSingleton<IRunnerImageBuilder, UnconfiguredRunnerImageBuilder>();
 builder.Services.AddSingleton<IRunnerImageValidator, UnconfiguredRunnerImageValidator>();
 builder.Services.AddSingleton<RunnerImageBuildQueue>();
@@ -319,7 +322,176 @@ app.MapPost("/api/runner-images", (
     })
     .RequireAuthorization(AccessPolicies.CanManage);
 
+app.MapGet("/api/runner-vm", (IRunnerVmStore runnerVms) => Results.Ok(runnerVms.List()))
+    .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-vms", (IRunnerVmStore runnerVms) => Results.Ok(runnerVms.List()))
+    .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-vm/{id}", (string id, IRunnerVmStore runnerVms) =>
+    {
+        var vm = runnerVms.Get(id);
+        return vm is null ? Results.NotFound() : Results.Ok(vm);
+    })
+    .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-vms/{id}", (string id, IRunnerVmStore runnerVms) =>
+    {
+        var vm = runnerVms.Get(id);
+        return vm is null ? Results.NotFound() : Results.Ok(vm);
+    })
+    .RequireAuthorization(AccessPolicies.CanView);
+
+app.MapPost("/api/runner-vm", (CreateRunnerVmRequest? request, IRunnerVmStore runnerVms, IRunnerImageStore images, IOptions<RunnerOptions> runnerOptions) =>
+    {
+        var selectedImage = GetRequestedImageVersion(request, images);
+        if (selectedImage is null)
+        {
+            return Results.BadRequest(new { error = "No validated runner image is available." });
+        }
+
+        var vm = runnerVms.Create(selectedImage, runnerOptions.Value.Label, "Shared Linux");
+        return Results.Accepted($"/api/runner-vms/{vm.Id}", vm);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPost("/api/runner-vms", (CreateRunnerVmRequest? request, IRunnerVmStore runnerVms, IRunnerImageStore images, IOptions<RunnerOptions> runnerOptions) =>
+    {
+        var selectedImage = GetRequestedImageVersion(request, images);
+        if (selectedImage is null)
+        {
+            return Results.BadRequest(new { error = "No validated runner image is available." });
+        }
+
+        var vm = runnerVms.Create(selectedImage, runnerOptions.Value.Label, "Shared Linux");
+        return Results.Accepted($"/api/runner-vms/{vm.Id}", vm);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPatch("/api/runner-vm/{id}", (string id, UpdateRunnerVmStatusRequest? request, IRunnerVmStore runnerVms) =>
+    {
+        if (request is null)
+        {
+            return Results.BadRequest(new { error = "Provide a status update." });
+        }
+
+        var vm = runnerVms.Get(id);
+        if (vm is null)
+        {
+            return Results.NotFound();
+        }
+
+        var updated = runnerVms.Update(id, current => current with
+        {
+            Status = request.Status,
+            JobStatus = request.Status.ToString().ToLowerInvariant(),
+            Outcome = request.Outcome ?? current.Outcome,
+            FailureReason = request.Error ?? current.FailureReason,
+            IsRetired = request.IsRetired ?? current.IsRetired,
+            RetryScheduled = request.RetryScheduled ?? current.RetryScheduled,
+            UpdatedAt = DateTimeOffset.UtcNow
+        });
+        return Results.Ok(updated);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPatch("/api/runner-vms/{id}", (string id, UpdateRunnerVmStatusRequest? request, IRunnerVmStore runnerVms) =>
+    {
+        if (request is null)
+        {
+            return Results.BadRequest(new { error = "Provide a status update." });
+        }
+
+        var vm = runnerVms.Get(id);
+        if (vm is null)
+        {
+            return Results.NotFound();
+        }
+
+        var updated = runnerVms.Update(id, current => current with
+        {
+            Status = request.Status,
+            JobStatus = request.Status.ToString().ToLowerInvariant(),
+            Outcome = request.Outcome ?? current.Outcome,
+            FailureReason = request.Error ?? current.FailureReason,
+            IsRetired = request.IsRetired ?? current.IsRetired,
+            RetryScheduled = request.RetryScheduled ?? current.RetryScheduled,
+            UpdatedAt = DateTimeOffset.UtcNow
+        });
+        return Results.Ok(updated);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPatch("/api/runner-vm/{id}/status", (string id, RunnerVmStatus status, IRunnerVmStore runnerVms) =>
+    {
+        var vm = runnerVms.Get(id);
+        if (vm is null)
+        {
+            return Results.NotFound();
+        }
+
+        var updated = runnerVms.Update(id, current => current with
+        {
+            Status = status,
+            JobStatus = status.ToString().ToLowerInvariant(),
+            UpdatedAt = DateTimeOffset.UtcNow
+        });
+        return Results.Ok(updated);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPatch("/api/runner-vms/{id}/status", (string id, RunnerVmStatus status, IRunnerVmStore runnerVms) =>
+    {
+        var vm = runnerVms.Get(id);
+        if (vm is null)
+        {
+            return Results.NotFound();
+        }
+
+        var updated = runnerVms.Update(id, current => current with
+        {
+            Status = status,
+            JobStatus = status.ToString().ToLowerInvariant(),
+            UpdatedAt = DateTimeOffset.UtcNow
+        });
+        return Results.Ok(updated);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPost("/api/runner-vm/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null) =>
+    {
+        var vm = runnerVms.Get(id);
+        if (vm is null)
+        {
+            return Results.NotFound();
+        }
+
+        var completed = runnerVms.Retire(id, outcome ?? "Success", error);
+        return Results.Ok(completed);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPost("/api/runner-vms/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null) =>
+    {
+        var vm = runnerVms.Get(id);
+        if (vm is null)
+        {
+            return Results.NotFound();
+        }
+
+        var completed = runnerVms.Retire(id, outcome ?? "Success", error);
+        return Results.Ok(completed);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
 app.Run();
+
+static string? GetRequestedImageVersion(CreateRunnerVmRequest? request, IRunnerImageStore images)
+{
+    if (request is not null && !string.IsNullOrWhiteSpace(request.ImageVersion))
+    {
+        return request.ImageVersion;
+    }
+
+    return images.ListAvailable().FirstOrDefault()?.Version;
+}
 
 static bool HasGroup(ClaimsPrincipal user, string groupId)
 {

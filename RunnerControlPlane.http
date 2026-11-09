@@ -19,6 +19,11 @@ GET {{baseUrl}}/api/runner-images/available
 Authorization: Bearer {{accessToken}}
 Accept: application/json
 
+### List runner VMs
+GET {{baseUrl}}/api/runner-vms
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
 ### Request an expedited image build
 # Replace these sample pins with versions approved for your repositories.
 # @name buildImage
@@ -40,3 +45,44 @@ Content-Type: application/json
 GET {{baseUrl}}/api/runner-images/{{buildImage.response.body.$.version}}
 Authorization: Bearer {{accessToken}}
 Accept: application/json
+
+### Request one Runner VM
+# Set imageVersion to a validated image version from GET /api/runner-images/available.
+# The request is available to operators only.
+# @name createRunnerVm
+POST {{baseUrl}}/api/runner-vms
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "imageVersion": "24.04"
+}
+
+### Inspect the runner VM requested above
+GET {{baseUrl}}/api/runner-vms/{{createRunnerVm.response.body.$.id}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### Update runner VM status and outcome
+PATCH {{baseUrl}}/api/runner-vms/{{createRunnerVm.response.body.$.id}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "status": "Finished",
+  "outcome": "Success",
+  "error": null,
+  "retryScheduled": false,
+  "isRetired": false
+}
+
+### Update only the runner VM status
+PATCH {{baseUrl}}/api/runner-vms/{{createRunnerVm.response.body.$.id}}/status?status=Working
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### Retire a runner VM
+POST {{baseUrl}}/api/runner-vms/{{createRunnerVm.response.body.$.id}}/retire?outcome=Success
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
