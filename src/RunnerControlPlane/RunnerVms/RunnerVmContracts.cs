@@ -49,7 +49,14 @@ public sealed record RunnerVmRecord(
     string? FailureReason = null,
     DateTimeOffset? CreatedAt = null,
     DateTimeOffset? UpdatedAt = null,
-    string? RunnerGroup = null)
+    string? RunnerGroup = null,
+    bool IsUnhealthy = false,
+    bool AcceptingJobs = true,
+    int VmHealthFailures = 0,
+    int RunnerConnectivityFailures = 0,
+    string? VmHealthFailureReason = null,
+    string? RunnerConnectivityFailureReason = null,
+    string? HealthFailureReason = null)
 {
     public string VmId => Id;
 
@@ -86,6 +93,12 @@ public sealed record UpdateRunnerVmStatusRequest(
     string? Error = null,
     bool? RetryScheduled = null,
     bool? IsRetired = null);
+
+public sealed record RunnerVmHealthCheckRequest(
+    bool VmHealthSucceeded,
+    bool RunnerConnectivitySucceeded,
+    string? VmHealthFailureReason = null,
+    string? RunnerConnectivityFailureReason = null);
 
 public sealed record RunnerVmAuditRecord(
     string Actor,

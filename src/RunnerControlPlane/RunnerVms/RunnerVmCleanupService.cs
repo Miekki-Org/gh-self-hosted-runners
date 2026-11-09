@@ -25,7 +25,7 @@ public sealed class RunnerVmCleanupService(
         var minimumCapacity = options.Value.MinimumCapacity;
         var gracePeriod = TimeSpan.FromSeconds(Math.Max(0, options.Value.IdleGracePeriodSeconds));
         var idleVms = runnerVms.List()
-            .Where(vm => vm.Status == RunnerVmStatus.Idle && !vm.IsRetired)
+            .Where(vm => vm.Status == RunnerVmStatus.Idle && !vm.IsRetired && !vm.IsUnhealthy)
             .Where(vm => vm.UpdatedAt is not null && vm.UpdatedAt.Value.Add(gracePeriod) <= now)
             .OrderBy(vm => vm.UpdatedAt ?? DateTimeOffset.MinValue)
             .ToArray();
@@ -36,7 +36,8 @@ public sealed class RunnerVmCleanupService(
         }
 
         var retired = 0;
-        var eligibleIdleCount = runnerVms.List().Count(vm => vm.Status == RunnerVmStatus.Idle && !vm.IsRetired);
+        var eligibleIdleCount = runnerVms.List()
+            .Count(vm => vm.Status == RunnerVmStatus.Idle && !vm.IsRetired && !vm.IsUnhealthy);
         foreach (var vm in idleVms)
         {
             if (eligibleIdleCount <= minimumCapacity)

@@ -93,6 +93,177 @@ public sealed class RunnerVmEndpointTests
     }
 
     [Fact]
+    public async Task OneHealthCheckFailureDoesNotMarkRunnerVmUnhealthy()
+    {
+        using var factory = new RunnerVmControlPlaneFactory(healthFailureThreshold: 3);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var created = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("24.04"));
+        var vm = await created.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+        var healthCheck = await client.PostAsJsonAsync(
+            $"/api/runner-vms/{vm!.Id}/health-checks",
+            new
+            {
+                vmHealthSucceeded = false,
+                runnerConnectivitySucceeded = false,
+                vmHealthFailureReason = "Guest heartbeat timed out.",
+                runnerConnectivityFailureReason = "Runner is offline in GitHub."
+            });
+        var result = await healthCheck.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+
+        Assert.Equal(HttpStatusCode.OK, healthCheck.StatusCode);
+        Assert.False(result!.IsUnhealthy);
+        Assert.True(result.AcceptingJobs);
+        Assert.Equal(1, result.VmHealthFailures);
+        Assert.Equal(1, result.RunnerConnectivityFailures);
+        Assert.Contains("Guest heartbeat timed out.", result.HealthFailureReason);
+        Assert.Contains("Runner is offline in GitHub.", result.HealthFailureReason);
+    }
+
+    [Fact]
+    public async Task RepeatedFailureOfOnlyOneCheckDoesNotMarkRunnerVmUnhealthy()
+    {
+        using var factory = new RunnerVmControlPlaneFactory(healthFailureThreshold: 3);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var created = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("24.04"));
+        var vm = await created.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var healthCheck = await client.PostAsJsonAsync(
+                $"/api/runner-vms/{vm!.Id}/health-checks",
+                new RunnerVmHealthCheckRequest(
+                    false,
+                    true,
+                    "Guest heartbeat timed out."));
+            Assert.Equal(HttpStatusCode.OK, healthCheck.StatusCode);
+        }
+
+        var result = await client.GetFromJsonAsync<RunnerVmRecord>($"/api/runner-vms/{vm!.Id}", JsonOptions);
+
+        Assert.False(result!.IsUnhealthy);
+        Assert.True(result.AcceptingJobs);
+        Assert.Equal(3, result.VmHealthFailures);
+        Assert.Equal(0, result.RunnerConnectivityFailures);
+        Assert.Equal(RunnerVmStatus.Idle, result.Status);
+    }
+
+    [Fact]
+    public async Task RepeatedFailuresStopAssignmentsAndReplaceTheVmAfterItsJobDrains()
+    {
+        using var factory = new RunnerVmControlPlaneFactory(maximumCapacity: 3, healthFailureThreshold: 3);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var created = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("24.04"));
+        var vm = await created.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+        var started = await client.PatchAsJsonAsync(
+            $"/api/runner-vms/{vm!.Id}",
+            new UpdateRunnerVmStatusRequest(RunnerVmStatus.Working));
+        Assert.Equal(HttpStatusCode.OK, started.StatusCode);
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var healthCheck = await client.PostAsJsonAsync(
+                $"/api/runner-vms/{vm.Id}/health-checks",
+                new RunnerVmHealthCheckRequest(
+                    false,
+                    false,
+                    "Guest heartbeat timed out.",
+                    "Runner is offline in GitHub."));
+            Assert.Equal(HttpStatusCode.OK, healthCheck.StatusCode);
+        }
+
+        var unhealthy = await client.GetFromJsonAsync<RunnerVmRecord>($"/api/runner-vms/{vm.Id}", JsonOptions);
+        var beforeDrain = await client.GetFromJsonAsync<RunnerVmRecord[]>("/api/runner-vms", JsonOptions);
+        Assert.True(unhealthy!.IsUnhealthy);
+        Assert.False(unhealthy.AcceptingJobs);
+        Assert.Equal(RunnerVmStatus.Working, unhealthy.Status);
+        Assert.False(unhealthy.IsRetired);
+        Assert.Single(beforeDrain!);
+
+        await client.PostAsJsonAsync(
+            $"/api/runner-vms/{vm.Id}/health-checks",
+            new RunnerVmHealthCheckRequest(true, true));
+        var stillUnhealthy = await client.GetFromJsonAsync<RunnerVmRecord>($"/api/runner-vms/{vm.Id}", JsonOptions);
+        Assert.Equal(unhealthy.HealthFailureReason, stillUnhealthy!.HealthFailureReason);
+
+        var finished = await client.PatchAsJsonAsync(
+            $"/api/runner-vms/{vm.Id}",
+            new UpdateRunnerVmStatusRequest(RunnerVmStatus.Finished, "Success"));
+        var retired = await finished.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+        var runnerVms = await client.GetFromJsonAsync<RunnerVmRecord[]>("/api/runner-vms", JsonOptions);
+        var audit = await client.GetFromJsonAsync<RunnerVmAuditRecord[]>("/api/runner-vms/audit", JsonOptions);
+        var capacity = await client.GetFromJsonAsync<CapacitySnapshot>("/api/runner-capacity");
+
+        Assert.Equal(HttpStatusCode.OK, finished.StatusCode);
+        Assert.True(retired!.IsRetired);
+        Assert.False(retired.RetryScheduled);
+        Assert.Equal("Success", retired.Outcome);
+        Assert.Equal(2, runnerVms!.Length);
+        Assert.Equal("automatic-unhealthy-retire", audit![0].Action);
+        Assert.Equal("system", audit[0].Actor);
+        Assert.Equal("succeeded", audit[0].Outcome);
+        Assert.InRange(capacity!.CurrentCapacity, 0, capacity.MaximumCapacity);
+    }
+
+    [Fact]
+    public async Task OperatorCanForceRemoveWorkingVmAndCapacityRequestRespectsMaximum()
+    {
+        using var factory = new RunnerVmControlPlaneFactory(maximumCapacity: 1);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var created = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("24.04"));
+        var vm = await created.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+        await client.PatchAsJsonAsync(
+            $"/api/runner-vms/{vm!.Id}",
+            new UpdateRunnerVmStatusRequest(RunnerVmStatus.Working));
+
+        var forceRemove = await client.PostAsync($"/api/runner-vms/{vm.Id}/force-remove", null);
+        var removed = await forceRemove.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+        var audit = await client.GetFromJsonAsync<RunnerVmAuditRecord[]>("/api/runner-vms/audit", JsonOptions);
+        var capacityAudit = await client.GetFromJsonAsync<CapacityAuditRecord[]>("/api/runner-capacity/audit");
+        var capacity = await client.GetFromJsonAsync<CapacitySnapshot>("/api/runner-capacity");
+        var removalAudit = Assert.Single(audit!);
+        var scaleOutAudit = Assert.Single(capacityAudit!);
+
+        Assert.Equal(HttpStatusCode.OK, forceRemove.StatusCode);
+        Assert.True(removed!.IsRetired);
+        Assert.False(removed.RetryScheduled);
+        Assert.Equal("replacement-capped", removed.Outcome);
+        Assert.Equal("force-remove", removalAudit.Action);
+        Assert.Equal("Capacity Test Operator", removalAudit.Actor);
+        Assert.NotEqual(default, removalAudit.Timestamp);
+        Assert.Contains("capped", scaleOutAudit.Outcome, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, capacity!.CurrentCapacity);
+        Assert.Equal(1, capacity.MaximumCapacity);
+    }
+
+    [Fact]
+    public async Task StatusUpdateCannotRetireRunnerVmWithoutAnAuditedRemovalAction()
+    {
+        using var factory = new RunnerVmControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var created = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("24.04"));
+        var vm = await created.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+        var update = await client.PatchAsJsonAsync(
+            $"/api/runner-vms/{vm!.Id}",
+            new UpdateRunnerVmStatusRequest(RunnerVmStatus.Finished, IsRetired: true));
+        var current = await client.GetFromJsonAsync<RunnerVmRecord>($"/api/runner-vms/{vm.Id}", JsonOptions);
+        var audit = await client.GetFromJsonAsync<RunnerVmAuditRecord[]>("/api/runner-vms/audit", JsonOptions);
+
+        Assert.Equal(HttpStatusCode.BadRequest, update.StatusCode);
+        Assert.False(current!.IsRetired);
+        Assert.Empty(audit!);
+    }
+
+    [Fact]
     public async Task SystemRetiresIdleVmAfterGracePeriodWhileKeepingWarmPoolMinimum()
     {
         using var factory = new RunnerVmControlPlaneFactory(
@@ -114,12 +285,12 @@ public sealed class RunnerVmEndpointTests
         var cleanup = factory.Services.GetRequiredService<IRunnerVmCleanupService>();
         var retired = await cleanup.RetireIdleVmsAsync();
         var audit = await client.GetFromJsonAsync<RunnerVmAuditRecord[]>($"/api/runner-vms/audit", JsonOptions);
+        var auditRecord = Assert.Single(audit!);
 
         Assert.Equal(1, retired);
-        Assert.Equal(1, audit!.Length);
-        Assert.Equal("system", audit[0].Actor);
-        Assert.Equal("automatic-idle-retire", audit[0].Action);
-        Assert.Contains("retired", audit[0].Outcome, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("system", auditRecord.Actor);
+        Assert.Equal("automatic-idle-retire", auditRecord.Action);
+        Assert.Contains("retired", auditRecord.Outcome, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -134,21 +305,23 @@ public sealed class RunnerVmEndpointTests
         var retirement = await client.PostAsync($"/api/runner-vms/{vm!.Id}/retire?outcome=Success&actor=operator", null);
         var record = await retirement.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
         var audit = await client.GetFromJsonAsync<RunnerVmAuditRecord[]>($"/api/runner-vms/audit", JsonOptions);
+        var auditRecord = Assert.Single(audit!);
 
         Assert.Equal(HttpStatusCode.OK, retirement.StatusCode);
         Assert.Equal(RunnerVmStatus.Finished, record!.Status);
         Assert.True(record.IsRetired);
         Assert.Equal("Success", record.Outcome);
-        Assert.Single(audit!);
-        Assert.Equal("operator", audit[0].Actor);
-        Assert.Equal("manual-retire", audit[0].Action);
-        Assert.Equal("succeeded", audit[0].Outcome);
+        Assert.Equal("operator", auditRecord.Actor);
+        Assert.Equal("manual-retire", auditRecord.Action);
+        Assert.Equal("succeeded", auditRecord.Outcome);
     }
 
     private sealed class RunnerVmControlPlaneFactory(
         int minimumCapacity = 1,
+        int maximumCapacity = 10,
         int idleGracePeriodSeconds = 300,
-        int reconcileIntervalSeconds = 3600) : WebApplicationFactory<Program>
+        int reconcileIntervalSeconds = 3600,
+        int healthFailureThreshold = 3) : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -167,8 +340,10 @@ public sealed class RunnerVmEndpointTests
                     ["GitHub:RunnerGroupId"] = "42",
                     ["Runner:Label"] = "linux-dotnet",
                     ["RunnerCapacity:MinimumCapacity"] = minimumCapacity.ToString(),
+                    ["RunnerCapacity:MaximumCapacity"] = maximumCapacity.ToString(),
                     ["RunnerCapacity:IdleGracePeriodSeconds"] = idleGracePeriodSeconds.ToString(),
-                    ["RunnerCapacity:ReconcileIntervalSeconds"] = reconcileIntervalSeconds.ToString()
+                    ["RunnerCapacity:ReconcileIntervalSeconds"] = reconcileIntervalSeconds.ToString(),
+                    ["RunnerVm:HealthFailureThreshold"] = healthFailureThreshold.ToString()
                 });
             });
 
@@ -220,7 +395,9 @@ public sealed class RunnerVmEndpointTests
             }
 
             var principal = new ClaimsPrincipal(
-                new ClaimsIdentity([new Claim("groups", group)], "Test"));
+                new ClaimsIdentity(
+                    [new Claim("groups", group), new Claim("name", "Capacity Test Operator")],
+                    "Test"));
             return Task.FromResult(AuthenticateResult.Success(
                 new AuthenticationTicket(principal, "Test")));
         }

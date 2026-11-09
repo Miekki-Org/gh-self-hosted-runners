@@ -4,6 +4,12 @@ Runner capacity is reconciled every `RunnerCapacity:ReconcileIntervalSeconds` se
 
 Readers can view capacity at `GET /api/runner-capacity` and in the control-plane website. Operators can update the minimum and maximum with `PUT /api/runner-capacity/settings` and request one-off scale-out with `POST /api/runner-capacity/scale-out`. Both operations are capped by the maximum and add an actor, UTC timestamp, action, and outcome to `GET /api/runner-capacity/audit`.
 
+## Runner VM health recovery
+
+Set `RunnerVm:HealthFailureThreshold` to the number of consecutive failures required for each check; it defaults to three and must be at least two. Operators report each VM-health and GitHub runner-connectivity result to `POST /api/runner-vms/{id}/health-checks` with `vmHealthSucceeded`, `runnerConnectivitySucceeded`, and optional per-check failure reasons. A success resets that check's consecutive-failure count. A VM becomes unhealthy only when both counts reach the threshold; its failure counts and reasons are visible on the Runner VM API.
+
+An unhealthy idle Runner VM is retired and replacement capacity is requested subject to the configured maximum. An unhealthy Runner VM with an active job stops accepting new work and is retired after the job finishes; the control plane does not retry the job. Operators can use `POST /api/runner-vms/{id}/force-remove` to remove a VM before its job drains. Removal and replacement requests appear in the Runner VM and capacity audit APIs.
+
 ## Azure VM Scale Set
 
 Live VM Scale Set operations are disabled by default. Configure the following settings and set `AzureVmScaleSet:Enabled` to `true` to enable them:
