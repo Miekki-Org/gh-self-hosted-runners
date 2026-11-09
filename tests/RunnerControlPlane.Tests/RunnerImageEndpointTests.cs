@@ -13,6 +13,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RunnerControlPlane.Images;
+using RunnerControlPlane.RunnerCapacity;
 
 namespace RunnerControlPlane.Tests;
 
@@ -254,6 +255,8 @@ public sealed class RunnerImageEndpointTests
 
             builder.ConfigureTestServices(services =>
             {
+                services.RemoveAll<IGitHubRunnerCapacityClient>();
+                services.AddSingleton<IGitHubRunnerCapacityClient, TestGitHubRunnerCapacityClient>();
                 services.RemoveAll<IRunnerImageBuilder>();
                 services.AddSingleton<IRunnerImageBuilder>(Builder);
                 services.RemoveAll<IRunnerImageValidator>();

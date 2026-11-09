@@ -15,6 +15,11 @@ public static class RunnerAccessPage
             button { margin: 1rem 0; padding: .5rem 1rem; }
             #message { min-height: 1.5rem; }
             .warning { color: #9a3412; }
+            .capacity-grid { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; }
+            .capacity-grid dt { font-weight: 600; }
+            .capacity-grid dd { margin: 0; }
+            .capacity-form { margin-top: 1rem; }
+            .capacity-form label { margin-right: .5rem; }
           </style>
         </head>
         <body>
@@ -37,11 +42,44 @@ public static class RunnerAccessPage
               <textarea id="repositories" spellcheck="false"></textarea>
               <button type="submit">Save allowlist</button>
             </form>
+            <section aria-labelledby="capacity-heading">
+              <h2 id="capacity-heading">Runner capacity</h2>
+              <p id="capacity-message" role="status">Loading runner capacity…</p>
+              <dl class="capacity-grid">
+                <dt>Minimum</dt><dd id="capacity-minimum"></dd>
+                <dt>Maximum</dt><dd id="capacity-maximum"></dd>
+                <dt>Current VMs</dt><dd id="capacity-current"></dd>
+                <dt>Busy runners</dt><dd id="capacity-busy"></dd>
+                <dt>Idle capacity</dt><dd id="capacity-idle"></dd>
+                <dt>Queued eligible jobs</dt><dd id="capacity-queued"></dd>
+                <dt>Unserved queued jobs</dt><dd id="capacity-unserved"></dd>
+              </dl>
+              <form id="capacity-settings-form" class="capacity-form" hidden>
+                <h3>Configure capacity</h3>
+                <label for="capacity-minimum-input">Minimum</label>
+                <input id="capacity-minimum-input" type="number" min="0" required>
+                <label for="capacity-maximum-input">Maximum</label>
+                <input id="capacity-maximum-input" type="number" min="1" required>
+                <button type="submit">Save capacity</button>
+              </form>
+              <form id="capacity-scale-out-form" class="capacity-form" hidden>
+                <h3>Request one-off scale-out</h3>
+                <label for="capacity-scale-out-count">Additional VMs</label>
+                <input id="capacity-scale-out-count" type="number" min="1" value="1" required>
+                <button type="submit">Request scale-out</button>
+              </form>
+            </section>
           </main>
           <script>
             const message = document.getElementById("message");
             const form = document.getElementById("allowlist-form");
             const repositories = document.getElementById("repositories");
+            const capacityMessage = document.getElementById("capacity-message");
+            const capacitySettingsForm = document.getElementById("capacity-settings-form");
+            const capacityScaleOutForm = document.getElementById("capacity-scale-out-form");
+            const capacityMinimumInput = document.getElementById("capacity-minimum-input");
+            const capacityMaximumInput = document.getElementById("capacity-maximum-input");
+            const capacityScaleOutCount = document.getElementById("capacity-scale-out-count");
 
             function render(configuration) {
               document.getElementById("organization").textContent = configuration.organization;
@@ -58,8 +96,39 @@ public static class RunnerAccessPage
                 return item;
               }));
               form.hidden = !configuration.canManage;
+              capacitySettingsForm.hidden = !configuration.canManage;
+              capacityScaleOutForm.hidden = !configuration.canManage;
               repositories.value = configuration.repositories.join("\n");
               message.textContent = "";
+            }
+
+            function renderCapacity(capacity) {
+              document.getElementById("capacity-minimum").textContent = capacity.minimumCapacity;
+              document.getElementById("capacity-maximum").textContent = capacity.maximumCapacity;
+              document.getElementById("capacity-current").textContent = capacity.currentCapacity;
+              document.getElementById("capacity-busy").textContent = capacity.busyRunners;
+              document.getElementById("capacity-idle").textContent = capacity.idleCapacity;
+              document.getElementById("capacity-queued").textContent = capacity.queuedJobs;
+              document.getElementById("capacity-unserved").textContent = capacity.unservedJobs;
+              capacityMessage.textContent = capacity.unservedJobs > 0
+                ? `Capacity is capped at ${capacity.maximumCapacity}; ${capacity.unservedJobs} queued job(s) remain queued.`
+                : capacity.currentCapacity > capacity.maximumCapacity
+                  ? "Capacity is above the configured maximum while running jobs drain."
+                  : capacity.isCapped
+                    ? "The configured maximum is below the number of busy runners; no additional VMs will be added."
+                    : "Capacity is within the configured limit.";
+              capacityMessage.className = capacity.isCapped ? "warning" : "";
+              capacityMinimumInput.value = capacity.minimumCapacity;
+              capacityMaximumInput.value = capacity.maximumCapacity;
+            }
+
+            async function loadCapacity() {
+              const response = await fetch("/api/runner-capacity");
+              if (!response.ok) {
+                capacityMessage.textContent = "Runner capacity could not be loaded.";
+                return;
+              }
+              renderCapacity(await response.json());
             }
 
             async function load() {
@@ -71,6 +140,7 @@ public static class RunnerAccessPage
                 return;
               }
               render(await response.json());
+              await loadCapacity();
             }
 
             form.addEventListener("submit", async event => {
@@ -92,7 +162,52 @@ public static class RunnerAccessPage
               message.textContent = "Allowlist saved.";
             });
 
-            load().catch(() => { message.textContent = "Runner access could not be loaded."; });
+            capacitySettingsForm.addEventListener("submit", async event => {
+              event.preventDefault();
+              capacityMessage.textContent = "Saving capacity settings…";
+              const response = await fetch("/api/runner-capacity/settings", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  minimumCapacity: Number(capacityMinimumInput.value),
+                  maximumCapacity: Number(capacityMaximumInput.value)
+                })
+              });
+              if (!response.ok) {
+                const error = await response.json().catch(() => ({}));
+                capacityMessage.textContent = error.error || error.title || "Capacity settings could not be saved.";
+                return;
+              }
+              renderCapacity(await response.json());
+            });
+
+            capacityScaleOutForm.addEventListener("submit", async event => {
+              event.preventDefault();
+              capacityMessage.textContent = "Requesting scale-out…";
+              const response = await fetch("/api/runner-capacity/scale-out", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ count: Number(capacityScaleOutCount.value) })
+              });
+              if (!response.ok) {
+                const error = await response.json().catch(() => ({}));
+                capacityMessage.textContent = error.error || error.title || "Scale-out could not be requested.";
+                return;
+              }
+              const result = await response.json();
+              renderCapacity(result.capacity);
+              capacityMessage.textContent = result.isCapped
+                ? `Added ${result.addedCount} VM(s); maximum capacity is reached.`
+                : `Added ${result.addedCount} VM(s).`;
+            });
+
+            load().catch(() => {
+              message.textContent = "Runner access could not be loaded.";
+              capacityMessage.textContent = "Runner capacity could not be loaded.";
+            });
+            window.setInterval(() => loadCapacity().catch(() => {
+              capacityMessage.textContent = "Runner capacity could not be refreshed.";
+            }), 30000);
           </script>
         </body>
         </html>
