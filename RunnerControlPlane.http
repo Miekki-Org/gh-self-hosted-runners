@@ -75,6 +75,44 @@ GET {{baseUrl}}/api/runner-images/{{buildImage.response.body.$.version}}
 Authorization: Bearer {{accessToken}}
 Accept: application/json
 
+### Start a canary rollout for the validated image (operators only)
+# The image must appear in GET /api/runner-images/available.
+# The rollout record reports its stage, deployed version, failure reason, and audit trail.
+# @name startImageRollout
+POST {{baseUrl}}/api/runner-images/rollouts
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "imageVersion": "{{buildImage.response.body.$.version}}"
+}
+
+### List image rollouts
+GET {{baseUrl}}/api/runner-images/rollouts
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### Inspect the rollout requested above
+GET {{baseUrl}}/api/runner-images/rollouts/{{startImageRollout.response.body.$.id}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### Mark the canary successful and promote the image to the remaining pool (operators only)
+# Use this only after external canary health checks pass.
+POST {{baseUrl}}/api/runner-images/rollouts/{{startImageRollout.response.body.$.id}}/canary/success
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+### Mark the canary failed and roll back (operators only)
+# Use instead of the success action when canary validation fails.
+POST {{baseUrl}}/api/runner-images/rollouts/{{startImageRollout.response.body.$.id}}/canary/failure
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "failureReason": "Canary health check failed."
+}
+
 ### Request one Runner VM
 # Set imageVersion to a validated image version from GET /api/runner-images/available.
 # The request is available to operators only.

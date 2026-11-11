@@ -14,6 +14,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RunnerControlPlane.Images;
 using RunnerControlPlane.RunnerCapacity;
+using RunnerControlPlane.RunnerVms;
 
 namespace RunnerControlPlane.Tests;
 
@@ -181,6 +182,71 @@ public sealed class RunnerImageEndpointTests
 
         Assert.Contains("did not contain exactly the pinned package set", failed.FailureReason);
         Assert.Empty(available!);
+    }
+
+    [Fact]
+    public async Task OperatorCanStartACanaryRolloutForAValidatedImage()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var response = await RequestBuildAsync(client);
+        var image = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        await WaitForStatusAsync(client, image!.Version, RunnerImageBuildStatus.Complete);
+
+        var oldVm = await client.PostAsJsonAsync(
+            "/api/runner-vms",
+            new CreateRunnerVmRequest(image.Version, "linux-dotnet"));
+        Assert.Equal(HttpStatusCode.Accepted, oldVm.StatusCode);
+
+        var rolloutResponse = await client.PostAsJsonAsync(
+            "/api/runner-images/rollout",
+            new { imageVersion = image.Version });
+        var rollout = await rolloutResponse.Content.ReadFromJsonAsync<RunnerImageRollout>(JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Accepted, rolloutResponse.StatusCode);
+        Assert.Equal(image.Version, rollout!.ImageVersion);
+        Assert.True(rollout.Stage == RunnerImageRolloutStage.Canary || rollout.Stage == RunnerImageRolloutStage.Pending);
+        Assert.NotNull(rollout.Id);
+    }
+
+    [Fact]
+    public async Task FailedCanaryRolloutRollsBackToThePreviousImageVersion()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var firstResponse = await RequestBuildAsync(client);
+        var first = await firstResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        await WaitForStatusAsync(client, first!.Version, RunnerImageBuildStatus.Complete);
+
+        var secondResponse = await RequestBuildAsync(client);
+        var second = await secondResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        await WaitForStatusAsync(client, second!.Version, RunnerImageBuildStatus.Complete);
+
+        var createVm = await client.PostAsJsonAsync(
+            "/api/runner-vms",
+            new CreateRunnerVmRequest(first.Version, "linux-dotnet"));
+        var vm = await createVm.Content.ReadFromJsonAsync<RunnerVmRecord>(JsonOptions);
+
+        var start = await client.PostAsJsonAsync(
+            "/api/runner-images/rollout",
+            new { imageVersion = second.Version, previousImageVersion = first.Version });
+        var rollout = await start.Content.ReadFromJsonAsync<RunnerImageRollout>(JsonOptions);
+
+        var failed = await client.PostAsJsonAsync(
+            $"/api/runner-images/rollouts/{rollout!.Id}/canary/failure",
+            new { failureReason = "Canary health check failed." });
+        var failedRollout = await failed.Content.ReadFromJsonAsync<RunnerImageRollout>(JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Accepted, failed.StatusCode);
+        Assert.Equal(RunnerImageRolloutStage.Failed, failedRollout!.Stage);
+        Assert.Equal("Canary health check failed.", failedRollout.FailureReason);
+
+        var vms = await client.GetFromJsonAsync<RunnerVmRecord[]> ("/api/runner-vms", JsonOptions);
+        Assert.All(vms!, vmRecord => Assert.Equal(first.Version, vmRecord.ImageVersion));
     }
 
     private static Task<HttpResponseMessage> RequestBuildAsync(HttpClient client, bool expedited = true)
