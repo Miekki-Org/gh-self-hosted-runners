@@ -111,6 +111,8 @@ builder.Services.AddHttpClient<IGitHubRunnerCapacityClient, GitHubRunnerCapacity
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<IRunnerImageStore, InMemoryRunnerImageStore>();
+builder.Services.AddSingleton<IRunnerImageRolloutStore, InMemoryRunnerImageRolloutStore>();
+builder.Services.AddSingleton<IRunnerImageRolloutService, RunnerImageRolloutService>();
 builder.Services.AddSingleton<IRunnerVmStore, InMemoryRunnerVmStore>();
 builder.Services.AddSingleton<IRunnerVmRecoveryService, RunnerVmRecoveryService>();
 builder.Services.AddSingleton<IRunnerVmCleanupService, RunnerVmCleanupService>();
@@ -355,6 +357,122 @@ app.MapPut("/api/runner-access", async (
 app.MapGet("/api/runner-images/available", (IRunnerImageStore images) =>
         Results.Ok(images.ListAvailable()))
     .RequireAuthorization(AccessPolicies.CanView);
+
+app.MapGet("/api/runner-images/rollout", (IRunnerImageRolloutStore rollouts) => Results.Ok(rollouts.List()))
+    .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-images/rollouts", (IRunnerImageRolloutStore rollouts) => Results.Ok(rollouts.List()))
+    .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-images/rollout/{id}", (string id, IRunnerImageRolloutStore rollouts) =>
+    {
+        var rollout = rollouts.Get(id);
+        return rollout is null ? Results.NotFound() : Results.Ok(rollout);
+    })
+    .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-images/rollouts/{id}", (string id, IRunnerImageRolloutStore rollouts) =>
+    {
+        var rollout = rollouts.Get(id);
+        return rollout is null ? Results.NotFound() : Results.Ok(rollout);
+    })
+    .RequireAuthorization(AccessPolicies.CanView);
+
+app.MapPost("/api/runner-images/rollout", async (
+        RunnerImageRolloutRequest? request,
+        ClaimsPrincipal user,
+        IRunnerImageRolloutService rolloutService,
+        CancellationToken cancellationToken) =>
+    {
+        if (request is null || string.IsNullOrWhiteSpace(request.ImageVersion))
+        {
+            return Results.BadRequest(new { error = "Provide the image version to roll out." });
+        }
+
+        try
+        {
+            var rollout = await rolloutService.StartAsync(request.ImageVersion, GetActor(user), cancellationToken);
+            return Results.Accepted($"/api/runner-images/rollout/{rollout.Id}", rollout);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+app.MapPost("/api/runner-images/rollouts", async (
+        RunnerImageRolloutRequest? request,
+        ClaimsPrincipal user,
+        IRunnerImageRolloutService rolloutService,
+        CancellationToken cancellationToken) =>
+    {
+        if (request is null || string.IsNullOrWhiteSpace(request.ImageVersion))
+        {
+            return Results.BadRequest(new { error = "Provide the image version to roll out." });
+        }
+
+        try
+        {
+            var rollout = await rolloutService.StartAsync(request.ImageVersion, GetActor(user), cancellationToken);
+            return Results.Accepted($"/api/runner-images/rollouts/{rollout.Id}", rollout);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPost("/api/runner-images/rollout/{id}/canary/success", async (
+        string id,
+        ClaimsPrincipal user,
+        IRunnerImageRolloutService rolloutService,
+        CancellationToken cancellationToken) =>
+    {
+        var rollout = await rolloutService.MarkCanarySuccessAsync(id, GetActor(user), cancellationToken);
+        return Results.Ok(rollout);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+app.MapPost("/api/runner-images/rollouts/{id}/canary/success", async (
+        string id,
+        ClaimsPrincipal user,
+        IRunnerImageRolloutService rolloutService,
+        CancellationToken cancellationToken) =>
+    {
+        var rollout = await rolloutService.MarkCanarySuccessAsync(id, GetActor(user), cancellationToken);
+        return Results.Ok(rollout);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPost("/api/runner-images/rollout/{id}/canary/failure", async (
+        string id,
+        RunnerImageRolloutFailureRequest? request,
+        ClaimsPrincipal user,
+        IRunnerImageRolloutService rolloutService,
+        CancellationToken cancellationToken) =>
+    {
+        if (request is null || string.IsNullOrWhiteSpace(request.FailureReason))
+        {
+            return Results.BadRequest(new { error = "Provide a canary failure reason." });
+        }
+
+        var rollout = await rolloutService.MarkCanaryFailureAsync(id, request.FailureReason, GetActor(user), cancellationToken);
+        return Results.Accepted($"/api/runner-images/rollout/{rollout.Id}", rollout);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
+app.MapPost("/api/runner-images/rollouts/{id}/canary/failure", async (
+        string id,
+        RunnerImageRolloutFailureRequest? request,
+        ClaimsPrincipal user,
+        IRunnerImageRolloutService rolloutService,
+        CancellationToken cancellationToken) =>
+    {
+        if (request is null || string.IsNullOrWhiteSpace(request.FailureReason))
+        {
+            return Results.BadRequest(new { error = "Provide a canary failure reason." });
+        }
+
+        var rollout = await rolloutService.MarkCanaryFailureAsync(id, request.FailureReason, GetActor(user), cancellationToken);
+        return Results.Accepted($"/api/runner-images/rollouts/{rollout.Id}", rollout);
+    })
+    .RequireAuthorization(AccessPolicies.CanManage);
 
 app.MapGet("/api/runner-capacity", async (
         IRunnerCapacityController capacity,
