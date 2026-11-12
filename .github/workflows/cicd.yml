@@ -1,0 +1,45 @@
+name: dotnet-test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7.0.1
+
+      - name: Show .NET version
+        run: dotnet --info
+
+      - name: Restore dependencies
+        run: dotnet restore RunnerControlPlane.sln
+
+      - name: Build
+        run: dotnet build RunnerControlPlane.sln --configuration Release --nologo --no-restore
+
+      - name: Run tests
+        run: >
+          dotnet test RunnerControlPlane.sln
+          --configuration Release
+          --nologo
+          --no-build
+          --logger "trx;LogFileName=test-results.trx"
+          --results-directory TestResults
+
+      - name: Publish test report
+        if: ${{ always() }}
+        uses: dorny/test-reporter@v3.0.0
+        with:
+          name: .NET test results
+          path: TestResults/*.trx
+          reporter: dotnet-trx
+          fail-on-error: true
