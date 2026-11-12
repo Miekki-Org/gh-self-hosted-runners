@@ -54,6 +54,16 @@ public sealed class InMemoryRunnerImageRolloutStore : IRunnerImageRolloutStore
 
         var updated = update(existing);
         _rollouts[id] = updated;
+
+        if (updated.AuditTrail is not null)
+        {
+            var previousCount = existing.AuditTrail?.Count ?? 0;
+            foreach (var audit in updated.AuditTrail.Skip(previousCount))
+            {
+                _auditTrail.Enqueue(audit);
+            }
+        }
+
         return updated;
     }
 
