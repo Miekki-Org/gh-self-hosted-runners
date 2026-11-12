@@ -249,6 +249,42 @@ public sealed class RunnerImageEndpointTests
         Assert.All(vms!, vmRecord => Assert.Equal(first.Version, vmRecord.ImageVersion));
     }
 
+    [Fact]
+    public async Task RolloutAuditTrailReflectsTheFullCanaryLifecycle()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var firstResponse = await RequestBuildAsync(client);
+        var first = await firstResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        await WaitForStatusAsync(client, first!.Version, RunnerImageBuildStatus.Complete);
+
+        var secondResponse = await RequestBuildAsync(client);
+        var second = await secondResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        await WaitForStatusAsync(client, second!.Version, RunnerImageBuildStatus.Complete);
+
+        var start = await client.PostAsJsonAsync(
+            "/api/runner-images/rollouts",
+            new { imageVersion = second.Version, previousImageVersion = first.Version });
+        var rollout = await start.Content.ReadFromJsonAsync<RunnerImageRollout>(JsonOptions);
+
+        var succeeded = await client.PostAsJsonAsync(
+            $"/api/runner-images/rollouts/{rollout!.Id}/canary/success",
+            new { });
+        Assert.Equal(HttpStatusCode.OK, succeeded.StatusCode);
+
+        var audit = await client.GetFromJsonAsync<RunnerImageRolloutAuditRecord[]>(
+            "/api/runner-images/rollouts/audit",
+            JsonOptions);
+
+        Assert.NotEmpty(audit!);
+        Assert.Contains(audit, record => record.Action == "request-rollout" && record.Outcome == "queued");
+        Assert.Contains(audit, record => record.Action == "canary-started" && record.Outcome == "canary");
+        Assert.Contains(audit, record => record.Action == "canary-succeeded" && record.Outcome == "succeeded");
+        Assert.All(audit, record => Assert.NotEqual(default, record.Timestamp));
+    }
+
     private static Task<HttpResponseMessage> RequestBuildAsync(HttpClient client, bool expedited = true)
     {
         return client.PostAsJsonAsync(

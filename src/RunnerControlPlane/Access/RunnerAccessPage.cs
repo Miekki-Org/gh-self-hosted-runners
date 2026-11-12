@@ -69,6 +69,11 @@ public static class RunnerAccessPage
                 <button type="submit">Request scale-out</button>
               </form>
             </section>
+            <section aria-labelledby="audit-heading">
+              <h2 id="audit-heading">Operational audit trail</h2>
+              <p id="audit-message" role="status">Loading audit history…</p>
+              <div id="audit-trail"></div>
+            </section>
           </main>
           <script>
             const message = document.getElementById("message");
@@ -80,6 +85,8 @@ public static class RunnerAccessPage
             const capacityMinimumInput = document.getElementById("capacity-minimum-input");
             const capacityMaximumInput = document.getElementById("capacity-maximum-input");
             const capacityScaleOutCount = document.getElementById("capacity-scale-out-count");
+            const auditTrail = document.getElementById("audit-trail");
+            const auditMessage = document.getElementById("audit-message");
 
             function render(configuration) {
               document.getElementById("organization").textContent = configuration.organization;
@@ -131,6 +138,50 @@ public static class RunnerAccessPage
               renderCapacity(await response.json());
             }
 
+            function renderAudit(entries) {
+              const rows = entries.map(entry => {
+                const time = new Date(entry.timestamp).toLocaleString();
+                return `
+                  <tr>
+                    <td>${entry.actor}</td>
+                    <td>${time}</td>
+                    <td>${entry.action}</td>
+                    <td>${entry.outcome}</td>
+                  </tr>
+                `;
+              }).join("");
+
+              auditTrail.innerHTML = `
+                <table>
+                  <thead>
+                    <tr><th>Actor</th><th>Timestamp</th><th>Action</th><th>Outcome</th></tr>
+                  </thead>
+                  <tbody>${rows || '<tr><td colspan="4">No audit entries.</td></tr>'}</tbody>
+                </table>
+              `;
+            }
+
+            async function loadAuditTrail() {
+              const responses = await Promise.all([
+                fetch("/api/runner-capacity/audit"),
+                fetch("/api/runner-images/rollouts/audit"),
+                fetch("/api/runner-vms/audit")
+              ]);
+
+              const entries = await Promise.all(responses.map(async response => {
+                if (!response.ok) {
+                  return [];
+                }
+                return await response.json();
+              }));
+
+              const merged = entries.flat().sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp));
+              renderAudit(merged);
+              auditMessage.textContent = merged.length > 0
+                ? `Showing ${merged.length} audited operation(s).`
+                : "No audit entries have been recorded yet.";
+            }
+
             async function load() {
               const response = await fetch("/api/runner-access");
               if (!response.ok) {
@@ -140,7 +191,7 @@ public static class RunnerAccessPage
                 return;
               }
               render(await response.json());
-              await loadCapacity();
+              await Promise.all([loadCapacity(), loadAuditTrail()]);
             }
 
             form.addEventListener("submit", async event => {
@@ -205,9 +256,14 @@ public static class RunnerAccessPage
               message.textContent = "Runner access could not be loaded.";
               capacityMessage.textContent = "Runner capacity could not be loaded.";
             });
-            window.setInterval(() => loadCapacity().catch(() => {
-              capacityMessage.textContent = "Runner capacity could not be refreshed.";
-            }), 30000);
+            window.setInterval(() => Promise.all([
+              loadCapacity().catch(() => {
+                capacityMessage.textContent = "Runner capacity could not be refreshed.";
+              }),
+              loadAuditTrail().catch(() => {
+                auditMessage.textContent = "Audit history could not be refreshed.";
+              })
+            ]), 30000);
           </script>
         </body>
         </html>

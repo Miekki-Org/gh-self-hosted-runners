@@ -362,6 +362,10 @@ app.MapGet("/api/runner-images/rollout", (IRunnerImageRolloutStore rollouts) => 
     .RequireAuthorization(AccessPolicies.CanView);
 app.MapGet("/api/runner-images/rollouts", (IRunnerImageRolloutStore rollouts) => Results.Ok(rollouts.List()))
     .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-images/rollout/audit", (IRunnerImageRolloutStore rollouts) => Results.Ok(rollouts.GetAuditTrail()))
+    .RequireAuthorization(AccessPolicies.CanView);
+app.MapGet("/api/runner-images/rollouts/audit", (IRunnerImageRolloutStore rollouts) => Results.Ok(rollouts.GetAuditTrail()))
+    .RequireAuthorization(AccessPolicies.CanView);
 app.MapGet("/api/runner-images/rollout/{id}", (string id, IRunnerImageRolloutStore rollouts) =>
     {
         var rollout = rollouts.Get(id);
