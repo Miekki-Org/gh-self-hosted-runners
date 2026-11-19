@@ -49,68 +49,281 @@ public sealed class RunnerImageEndpointTests
         using var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
 
-        var response = await RequestBuildAsync(client);
-        var queued = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        var completed = await WaitForStatusAsync(client, queued!.Version, RunnerImageBuildStatus.Complete);
+        var completed = await RegisterAndCompleteBuildAsync(client);
         var available = await client.GetFromJsonAsync<RunnerImage[]>("/api/runner-images/available", JsonOptions);
 
-        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-        Assert.True(queued.Expedited);
-        Assert.Equal("24.04", queued.BuildRequest.UbuntuRelease);
+        Assert.True(completed.Expedited);
+        Assert.Equal("24.04", completed.BuildRequest.UbuntuRelease);
         Assert.Equal(RunnerImageBuildStatus.Complete, completed.Status);
         Assert.Equal("24.04", completed.Inventory!.UbuntuRelease);
         Assert.Equal(["8.0.404", "9.0.203"], completed.Inventory.DotNetSdks);
         Assert.Equal("8.5.0", completed.Inventory.Packages["curl"]);
         Assert.Equal("2.331.0", completed.Inventory.RunnerVersion);
-        Assert.Contains(available!, image => image.Version == queued.Version);
+        Assert.Contains(available!, image => image.Version == completed.Version);
+    }
+
+    [Fact]
+    public async Task OperatorCanRegisterAnImageBuildAndReceiveItsManifestDigest()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var response = await RequestBuildAsync(client);
+        var registration = await response.Content.ReadFromJsonAsync<JsonElement>(JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.True(registration.TryGetProperty("buildId", out var buildId));
+        Assert.False(string.IsNullOrWhiteSpace(buildId.GetString()));
+        Assert.True(registration.TryGetProperty("manifestDigest", out var manifestDigest));
+        Assert.Matches("^[a-f0-9]{64}$", manifestDigest.GetString());
+    }
+
+    [Fact]
+    public async Task SuccessfulBuildResultMakesTheValidatedImageAvailable()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var registrationResponse = await RequestBuildAsync(client);
+        var registration = await registrationResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        var resultResponse = await client.PostAsJsonAsync(
+            $"/api/runner-images/{registration!.Version}/result",
+            new
+            {
+                manifestDigest = registration.ManifestDigest,
+                azureImageId = "/subscriptions/test/resourceGroups/images/providers/Microsoft.Compute/images/runner",
+                inventory = new
+                {
+                    ubuntuRelease = "24.04",
+                    dotNetSdks = new[] { "8.0.404", "9.0.203" },
+                    packages = new { curl = "8.5.0" },
+                    runnerVersion = "2.331.0"
+                },
+                validation = new
+                {
+                    imageChecksPassed = true,
+                    vmBooted = true,
+                    gitHubRunnerRegistered = true,
+                    sampleDotNetBuildPassed = true
+                },
+                succeeded = true
+            });
+        var completed = await client.GetFromJsonAsync<RunnerImage>(
+            $"/api/runner-images/{registration.Version}",
+            JsonOptions);
+        var available = await client.GetFromJsonAsync<RunnerImage[]>("/api/runner-images/available", JsonOptions);
+
+        Assert.Equal(HttpStatusCode.OK, resultResponse.StatusCode);
+        Assert.Equal(RunnerImageBuildStatus.Complete, completed!.Status);
+        Assert.Equal(
+            "/subscriptions/test/resourceGroups/images/providers/Microsoft.Compute/images/runner",
+            completed.AzureImageId);
+        Assert.True(completed.BuildResult!.Validation.IsSuccessful);
+        Assert.Contains(available!, image => image.Version == registration.Version);
+    }
+
+    [Fact]
+    public async Task ConfiguredWorkloadIdentityCanReportBuildResults()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var operatorClient = factory.CreateClient();
+        operatorClient.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var registrationResponse = await RequestBuildAsync(operatorClient);
+        var registration = await registrationResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+
+        using var workloadClient = factory.CreateClient();
+        workloadClient.DefaultRequestHeaders.Add("X-Test-Role", "image-builder");
+        var result = await workloadClient.PostAsJsonAsync(
+            $"/api/runner-images/{registration!.Version}/result",
+            CreateResult(registration));
+
+        Assert.Equal(HttpStatusCode.OK, result.StatusCode);
+    }
+
+    [Fact]
+    public async Task DelegatedUserTokenForTheConfiguredClientCannotReportBuildResults()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var operatorClient = factory.CreateClient();
+        operatorClient.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var registrationResponse = await RequestBuildAsync(operatorClient);
+        var registration = await registrationResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+
+        using var delegatedClient = factory.CreateClient();
+        delegatedClient.DefaultRequestHeaders.Add("X-Test-Role", "delegated-image-builder");
+        var result = await delegatedClient.PostAsJsonAsync(
+            $"/api/runner-images/{registration!.Version}/result",
+            CreateResult(registration));
+
+        Assert.Equal(HttpStatusCode.Forbidden, result.StatusCode);
+    }
+
+    [Fact]
+    public async Task ReaderCannotReportBuildResults()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var operatorClient = factory.CreateClient();
+        operatorClient.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var registrationResponse = await RequestBuildAsync(operatorClient);
+        var registration = await registrationResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+
+        using var readerClient = factory.CreateClient();
+        readerClient.DefaultRequestHeaders.Add("X-Test-Role", "reader");
+        var result = await readerClient.PostAsJsonAsync(
+            $"/api/runner-images/{registration!.Version}/result",
+            CreateResult(registration));
+        var unchanged = await operatorClient.GetFromJsonAsync<RunnerImage>(
+            $"/api/runner-images/{registration.Version}",
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Forbidden, result.StatusCode);
+        Assert.Equal(RunnerImageBuildStatus.Building, unchanged!.Status);
+    }
+
+    [Fact]
+    public async Task RepeatingTheSameResultIsIdempotentAndConflictingRetryIsRejected()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var registrationResponse = await RequestBuildAsync(client);
+        var registration = await registrationResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        var result = CreateResult(registration!);
+
+        var first = await client.PostAsJsonAsync(
+            $"/api/runner-images/{registration!.Version}/result",
+            result);
+        var retry = await client.PostAsJsonAsync(
+            $"/api/runner-images/{registration.Version}/result",
+            result);
+        var conflictingRetry = await client.PostAsJsonAsync(
+            $"/api/runner-images/{registration.Version}/result",
+            result with
+            {
+                Succeeded = false,
+                FailureReason = "A conflicting failure."
+            });
+        var saved = await client.GetFromJsonAsync<RunnerImage>(
+            $"/api/runner-images/{registration.Version}",
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, retry.StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, conflictingRetry.StatusCode);
+        Assert.Equal(RunnerImageBuildStatus.Complete, saved!.Status);
+        Assert.Equal(2, saved.AuditTrail!.Count);
+    }
+
+    [Fact]
+    public async Task MismatchedManifestDigestIsRejectedWithoutChangingTheBuild()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var registrationResponse = await RequestBuildAsync(client);
+        var registration = await registrationResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/runner-images/{registration!.Version}/result",
+            CreateResult(registration) with { ManifestDigest = new string('0', 64) });
+        var saved = await client.GetFromJsonAsync<RunnerImage>(
+            $"/api/runner-images/{registration.Version}",
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(RunnerImageBuildStatus.Building, saved!.Status);
+        Assert.Null(saved.BuildResult);
+    }
+
+    [Fact]
+    public async Task BuildResultAndAuditSurviveAControlPlaneRestart()
+    {
+        var statePath = Path.Combine(Path.GetTempPath(), $"runner-image-{Guid.NewGuid():N}.json");
+        try
+        {
+            string buildId;
+            using (var factory = new RunnerImageControlPlaneFactory(statePath))
+            using (var client = factory.CreateClient())
+            {
+                client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+                var image = await RegisterAndCompleteBuildAsync(client);
+                buildId = image.Version;
+            }
+
+            using var restartedFactory = new RunnerImageControlPlaneFactory(statePath);
+            using var restartedClient = restartedFactory.CreateClient();
+            restartedClient.DefaultRequestHeaders.Add("X-Test-Role", "reader");
+
+            var imageAfterRestart = await restartedClient.GetFromJsonAsync<RunnerImage>(
+                $"/api/runner-images/{buildId}",
+                JsonOptions);
+            var available = await restartedClient.GetFromJsonAsync<RunnerImage[]>(
+                "/api/runner-images/available",
+                JsonOptions);
+
+            Assert.Equal(RunnerImageBuildStatus.Complete, imageAfterRestart!.Status);
+            Assert.Equal("2.331.0", imageAfterRestart.Inventory!.RunnerVersion);
+            Assert.Equal(2, imageAfterRestart.AuditTrail!.Count);
+            Assert.Contains(available!, image => image.Version == buildId);
+        }
+        finally
+        {
+            if (File.Exists(statePath))
+            {
+                File.Delete(statePath);
+            }
+        }
     }
 
     [Fact]
     public async Task FailedValidationNeverMakesAnImageAvailable()
     {
-        using var factory = new RunnerImageControlPlaneFactory(failValidation: true);
+        using var factory = new RunnerImageControlPlaneFactory();
         using var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
 
+        var existingImage = await RegisterAndCompleteBuildAsync(client);
         var response = await RequestBuildAsync(client);
-        var queued = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        var failed = await WaitForStatusAsync(client, queued!.Version, RunnerImageBuildStatus.Failed);
+        var registration = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        var resultResponse = await client.PostAsJsonAsync(
+            $"/api/runner-images/{registration!.Version}/result",
+            CreateResult(registration, succeeded: false));
+        var failed = await client.GetFromJsonAsync<RunnerImage>(
+            $"/api/runner-images/{registration.Version}",
+            JsonOptions);
         var available = await client.GetFromJsonAsync<RunnerImage[]>("/api/runner-images/available", JsonOptions);
 
-        Assert.Equal("The sample .NET build failed.", failed.FailureReason);
-        Assert.DoesNotContain(available!, image => image.Version == queued.Version);
+        Assert.Equal(HttpStatusCode.OK, resultResponse.StatusCode);
+        Assert.Equal("The sample .NET build failed.", failed!.FailureReason);
+        Assert.Contains(available!, image => image.Version == existingImage.Version);
+        Assert.DoesNotContain(available!, image => image.Version == registration.Version);
     }
 
     [Fact]
-    public async Task ExpeditedBuildRunsBeforeBuildsAlreadyWaitingInTheQueue()
+    public async Task SchedulingMetadataDoesNotChangeTheManifestDigest()
     {
-        using var factory = new RunnerImageControlPlaneFactory(holdBuilds: true);
+        using var factory = new RunnerImageControlPlaneFactory();
         using var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
 
-        var firstResponse = await RequestBuildAsync(client, expedited: false);
-        var first = await firstResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        await factory.Builder.FirstBuildStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var first = await RequestBuildAsync(client, expedited: false);
+        var second = await RequestBuildAsync(client, expedited: true);
+        var firstBuild = await first.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        var secondBuild = await second.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        var changedManifestResponse = await client.PostAsJsonAsync(
+            "/api/runner-images",
+            new RunnerImageBuildRequest(
+                "24.04",
+                ["8.0.404", "9.0.203"],
+                new Dictionary<string, string> { ["curl"] = "8.5.1" },
+                "2.331.0"));
+        var changedManifest = await changedManifestResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
 
-        var normalResponse = await RequestBuildAsync(client, expedited: false);
-        var normal = await normalResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        var expeditedResponse = await RequestBuildAsync(client, expedited: true);
-        var expedited = await expeditedResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-
-        factory.Builder.ReleaseFirstBuild();
-        await factory.Builder.SecondBuildStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        var expeditedStatus = await WaitForStatusAsync(
-            client,
-            expedited!.Version,
-            RunnerImageBuildStatus.Building);
-        var normalStatus = await client.GetFromJsonAsync<RunnerImage>(
-            $"/api/runner-images/{Uri.EscapeDataString(normal!.Version)}",
-            JsonOptions);
-
-        Assert.NotEqual(first!.Version, expeditedStatus.Version);
-        Assert.True(expeditedStatus.Expedited);
-        Assert.Equal(RunnerImageBuildStatus.Queued, normalStatus!.Status);
-        factory.Builder.ReleaseSecondBuild();
+        Assert.NotEqual(firstBuild!.BuildId, secondBuild!.BuildId);
+        Assert.Equal(firstBuild.ManifestDigest, secondBuild.ManifestDigest);
+        Assert.NotEqual(firstBuild.ManifestDigest, changedManifest!.ManifestDigest);
     }
 
     [Fact]
@@ -155,32 +368,59 @@ public sealed class RunnerImageEndpointTests
     [Fact]
     public async Task ImageWithInventoryThatDiffersFromThePinnedRequestIsRejected()
     {
-        using var factory = new RunnerImageControlPlaneFactory(mismatchInventory: true);
+        using var factory = new RunnerImageControlPlaneFactory();
         using var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
 
         var response = await RequestBuildAsync(client);
         var queued = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        var failed = await WaitForStatusAsync(client, queued!.Version, RunnerImageBuildStatus.Failed);
+        var result = CreateResult(queued!) with
+        {
+            Inventory = CreateInventory() with { RunnerVersion = "2.330.0" }
+        };
+        var rejected = await client.PostAsJsonAsync(
+            $"/api/runner-images/{queued!.Version}/result",
+            result);
+        var stillBuilding = await client.GetFromJsonAsync<RunnerImage>(
+            $"/api/runner-images/{queued.Version}",
+            JsonOptions);
         var available = await client.GetFromJsonAsync<RunnerImage[]>("/api/runner-images/available", JsonOptions);
 
-        Assert.Contains("did not match the pinned Ubuntu or GitHub Actions Runner version", failed.FailureReason);
+        Assert.Equal(HttpStatusCode.BadRequest, rejected.StatusCode);
+        Assert.Equal(RunnerImageBuildStatus.Building, stillBuilding!.Status);
         Assert.Empty(available!);
     }
 
     [Fact]
     public async Task ImageWithUnrequestedPackagesIsNotMadeAvailable()
     {
-        using var factory = new RunnerImageControlPlaneFactory(extraPackage: true);
+        using var factory = new RunnerImageControlPlaneFactory();
         using var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
 
         var response = await RequestBuildAsync(client);
         var queued = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        var failed = await WaitForStatusAsync(client, queued!.Version, RunnerImageBuildStatus.Failed);
+        var result = CreateResult(queued!) with
+        {
+            Inventory = CreateInventory() with
+            {
+                Packages = new Dictionary<string, string>
+                {
+                    ["curl"] = "8.5.0",
+                    ["unrequested-tool"] = "1.0.0"
+                }
+            }
+        };
+        var rejected = await client.PostAsJsonAsync(
+            $"/api/runner-images/{queued!.Version}/result",
+            result);
+        var stillBuilding = await client.GetFromJsonAsync<RunnerImage>(
+            $"/api/runner-images/{queued.Version}",
+            JsonOptions);
         var available = await client.GetFromJsonAsync<RunnerImage[]>("/api/runner-images/available", JsonOptions);
 
-        Assert.Contains("did not contain exactly the pinned package set", failed.FailureReason);
+        Assert.Equal(HttpStatusCode.BadRequest, rejected.StatusCode);
+        Assert.Equal(RunnerImageBuildStatus.Building, stillBuilding!.Status);
         Assert.Empty(available!);
     }
 
@@ -191,9 +431,7 @@ public sealed class RunnerImageEndpointTests
         using var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
 
-        var response = await RequestBuildAsync(client);
-        var image = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        await WaitForStatusAsync(client, image!.Version, RunnerImageBuildStatus.Complete);
+        var image = await RegisterAndCompleteBuildAsync(client);
 
         var oldVm = await client.PostAsJsonAsync(
             "/api/runner-vms",
@@ -218,13 +456,8 @@ public sealed class RunnerImageEndpointTests
         using var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
 
-        var firstResponse = await RequestBuildAsync(client);
-        var first = await firstResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        await WaitForStatusAsync(client, first!.Version, RunnerImageBuildStatus.Complete);
-
-        var secondResponse = await RequestBuildAsync(client);
-        var second = await secondResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        await WaitForStatusAsync(client, second!.Version, RunnerImageBuildStatus.Complete);
+        var first = await RegisterAndCompleteBuildAsync(client);
+        var second = await RegisterAndCompleteBuildAsync(client);
 
         var createVm = await client.PostAsJsonAsync(
             "/api/runner-vms",
@@ -256,13 +489,8 @@ public sealed class RunnerImageEndpointTests
         using var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
 
-        var firstResponse = await RequestBuildAsync(client);
-        var first = await firstResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        await WaitForStatusAsync(client, first!.Version, RunnerImageBuildStatus.Complete);
-
-        var secondResponse = await RequestBuildAsync(client);
-        var second = await secondResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
-        await WaitForStatusAsync(client, second!.Version, RunnerImageBuildStatus.Complete);
+        var first = await RegisterAndCompleteBuildAsync(client);
+        var second = await RegisterAndCompleteBuildAsync(client);
 
         var start = await client.PostAsJsonAsync(
             "/api/runner-images/rollouts",
@@ -297,44 +525,60 @@ public sealed class RunnerImageEndpointTests
                 Expedited: expedited));
     }
 
-    private static async Task<RunnerImage> WaitForStatusAsync(
-        HttpClient client,
-        string version,
-        RunnerImageBuildStatus expectedStatus)
+    private static async Task<RunnerImage> RegisterAndCompleteBuildAsync(HttpClient client)
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        while (!timeout.IsCancellationRequested)
-        {
-            var image = await client.GetFromJsonAsync<RunnerImage>(
-                $"/api/runner-images/{Uri.EscapeDataString(version)}",
-                JsonOptions,
-                timeout.Token);
-            if (image?.Status == expectedStatus)
-            {
-                return image;
-            }
+        var response = await RequestBuildAsync(client);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var image = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        Assert.NotNull(image);
 
-            await Task.Delay(TimeSpan.FromMilliseconds(10), timeout.Token);
-        }
+        var result = await client.PostAsJsonAsync(
+            $"/api/runner-images/{image.Version}/result",
+            CreateResult(image));
+        Assert.Equal(HttpStatusCode.OK, result.StatusCode);
 
-        throw new TimeoutException($"Runner image did not reach status {expectedStatus}.");
+        return await client.GetFromJsonAsync<RunnerImage>(
+            $"/api/runner-images/{image.Version}",
+            JsonOptions) ?? throw new InvalidOperationException("The registered image build was not found.");
+    }
+
+    private static RunnerImageBuildResult CreateResult(
+        RunnerImage image,
+        bool succeeded = true)
+    {
+        return new RunnerImageBuildResult(
+            image.ManifestDigest!,
+            "/subscriptions/test/resourceGroups/images/providers/Microsoft.Compute/images/runner",
+            CreateInventory(),
+            succeeded
+                ? new RunnerImageValidationResult(true, true, true, true)
+                : new RunnerImageValidationResult(
+                    true,
+                    true,
+                    true,
+                    false,
+                    "The sample .NET build failed."),
+            succeeded,
+            succeeded ? null : "The sample .NET build failed.");
+    }
+
+    private static RunnerImageInventory CreateInventory()
+    {
+        return new RunnerImageInventory(
+            "24.04",
+            ["8.0.404", "9.0.203"],
+            new Dictionary<string, string> { ["curl"] = "8.5.0" },
+            "2.331.0");
     }
 
     private sealed class RunnerImageControlPlaneFactory : WebApplicationFactory<Program>
     {
-        private readonly bool _failValidation;
+        private readonly string? _stateFilePath;
 
-        public RunnerImageControlPlaneFactory(
-            bool failValidation = false,
-            bool holdBuilds = false,
-            bool mismatchInventory = false,
-            bool extraPackage = false)
+        public RunnerImageControlPlaneFactory(string? stateFilePath = null)
         {
-            _failValidation = failValidation;
-            Builder = new FakeRunnerImageBuilder(holdBuilds, mismatchInventory, extraPackage);
+            _stateFilePath = stateFilePath;
         }
-
-        public FakeRunnerImageBuilder Builder { get; }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -351,7 +595,9 @@ public sealed class RunnerImageEndpointTests
                     ["GitHub:Organization"] = "octo",
                     ["GitHub:Token"] = "test-token",
                     ["GitHub:RunnerGroupId"] = "42",
-                    ["Runner:Label"] = "linux-dotnet"
+                    ["Runner:Label"] = "linux-dotnet",
+                    ["RunnerImageBuild:StateFilePath"] = _stateFilePath ?? "",
+                    ["RunnerImageBuild:WorkloadClientId"] = "image-builder-client"
                 });
             });
 
@@ -359,11 +605,6 @@ public sealed class RunnerImageEndpointTests
             {
                 services.RemoveAll<IGitHubRunnerCapacityClient>();
                 services.AddSingleton<IGitHubRunnerCapacityClient, TestGitHubRunnerCapacityClient>();
-                services.RemoveAll<IRunnerImageBuilder>();
-                services.AddSingleton<IRunnerImageBuilder>(Builder);
-                services.RemoveAll<IRunnerImageValidator>();
-                services.AddSingleton<IRunnerImageValidator>(
-                    new FakeRunnerImageValidator(_failValidation));
                 services.AddAuthentication()
                     .AddScheme<AuthenticationSchemeOptions, TestAuthenticationHandler>(
                         "Test",
@@ -379,74 +620,6 @@ public sealed class RunnerImageEndpointTests
         }
     }
 
-    public sealed class FakeRunnerImageBuilder(
-        bool holdBuilds,
-        bool mismatchInventory,
-        bool extraPackage) : IRunnerImageBuilder
-    {
-        private int _buildCount;
-        private readonly TaskCompletionSource _releaseFirstBuild = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource _releaseSecondBuild = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-
-        public TaskCompletionSource FirstBuildStarted { get; } = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        public TaskCompletionSource SecondBuildStarted { get; } = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-
-        public void ReleaseFirstBuild() => _releaseFirstBuild.TrySetResult();
-
-        public void ReleaseSecondBuild() => _releaseSecondBuild.TrySetResult();
-
-        public async Task<RunnerImageArtifact> BuildAsync(
-            string version,
-            RunnerImageBuildRequest request,
-            CancellationToken cancellationToken)
-        {
-            var buildNumber = Interlocked.Increment(ref _buildCount);
-            if (holdBuilds && buildNumber == 1)
-            {
-                FirstBuildStarted.TrySetResult();
-                await _releaseFirstBuild.Task.WaitAsync(cancellationToken);
-            }
-            else if (holdBuilds && buildNumber == 2)
-            {
-                SecondBuildStarted.TrySetResult();
-                await _releaseSecondBuild.Task.WaitAsync(cancellationToken);
-            }
-
-            var packages = new Dictionary<string, string> { ["curl"] = "8.5.0" };
-            if (extraPackage)
-            {
-                packages["unrequested-tool"] = "1.0.0";
-            }
-
-            return new RunnerImageArtifact(new RunnerImageInventory(
-                "24.04",
-                ["8.0.404", "9.0.203"],
-                packages,
-                mismatchInventory ? "2.330.0" : "2.331.0"));
-        }
-    }
-
-    private sealed class FakeRunnerImageValidator(bool failValidation) : IRunnerImageValidator
-    {
-        public Task<RunnerImageValidationResult> ValidateAsync(
-            RunnerImageArtifact image,
-            CancellationToken cancellationToken)
-        {
-            return Task.FromResult(failValidation
-                ? new RunnerImageValidationResult(
-                    true,
-                    true,
-                    true,
-                    false,
-                    "The sample .NET build failed.")
-                : new RunnerImageValidationResult(true, true, true, true));
-        }
-    }
-
     private sealed class TestAuthenticationHandler(
         IOptionsMonitor<AuthenticationSchemeOptions> options,
         ILoggerFactory logger,
@@ -455,19 +628,30 @@ public sealed class RunnerImageEndpointTests
     {
         protected override Task<AuthenticateResult> HandleAuthenticateAsync()
         {
-            var group = Request.Headers["X-Test-Role"].ToString() switch
+            var claims = Request.Headers["X-Test-Role"].ToString() switch
             {
-                "reader" => "reader-group",
-                "operator" => "operator-group",
+                "reader" => new[] { new Claim("groups", "reader-group") },
+                "operator" => new[] { new Claim("groups", "operator-group") },
+                "image-builder" =>
+                [
+                    new Claim("azp", "image-builder-client"),
+                    new Claim("idtyp", "app")
+                ],
+                "delegated-image-builder" =>
+                [
+                    new Claim("azp", "image-builder-client"),
+                    new Claim("idtyp", "user"),
+                    new Claim("scp", "image.result")
+                ],
                 _ => null
             };
-            if (group is null)
+            if (claims is null)
             {
                 return Task.FromResult(AuthenticateResult.NoResult());
             }
 
             var principal = new ClaimsPrincipal(
-                new ClaimsIdentity([new Claim("groups", group)], "Test"));
+                new ClaimsIdentity(claims, "Test"));
             return Task.FromResult(AuthenticateResult.Success(
                 new AuthenticationTicket(principal, "Test")));
         }

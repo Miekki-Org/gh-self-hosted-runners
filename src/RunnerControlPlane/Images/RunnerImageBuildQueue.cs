@@ -1,5 +1,3 @@
-using System.Collections.ObjectModel;
-
 namespace RunnerControlPlane.Images;
 
 public sealed class RunnerImageBuildQueue(
@@ -15,7 +13,7 @@ public sealed class RunnerImageBuildQueue(
 
     public RunnerImage Queue(RunnerImageBuildRequest request)
     {
-        var frozenRequest = Freeze(request);
+        var frozenRequest = RunnerImageSnapshot.Freeze(request);
         var version = $"ubuntu-{frozenRequest.UbuntuRelease}-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}";
         var image = store.AddQueued(version, frozenRequest);
         lock (_queueLock)
@@ -48,7 +46,7 @@ public sealed class RunnerImageBuildQueue(
         {
             store.Update(build.Version, image => image with { Status = RunnerImageBuildStatus.Building });
             var artifact = await builder.BuildAsync(build.Version, build.Request, cancellationToken);
-            var inventory = Freeze(artifact.Inventory);
+            var inventory = RunnerImageSnapshot.Freeze(artifact.Inventory);
             var validatedArtifact = new RunnerImageArtifact(inventory);
             store.Update(build.Version, image => image with
             {
@@ -56,7 +54,7 @@ public sealed class RunnerImageBuildQueue(
                 Inventory = inventory
             });
 
-            var inventoryFailure = ValidateInventory(build.Request, inventory);
+            var inventoryFailure = RunnerImageInventoryValidator.Validate(build.Request, inventory);
             if (inventoryFailure is not null)
             {
                 store.Update(build.Version, image => image with
@@ -102,70 +100,6 @@ public sealed class RunnerImageBuildQueue(
                     : exception.Message
             });
         }
-    }
-
-    private static string? ValidateInventory(
-        RunnerImageBuildRequest request,
-        RunnerImageInventory inventory)
-    {
-        if (!inventory.UbuntuRelease.Equals(request.UbuntuRelease, StringComparison.OrdinalIgnoreCase)
-            || !inventory.RunnerVersion.Equals(request.RunnerVersion, StringComparison.OrdinalIgnoreCase))
-        {
-            return "The built image did not match the pinned Ubuntu or GitHub Actions Runner version.";
-        }
-
-        var requestedSdks = new HashSet<string>(request.DotNetSdks, StringComparer.OrdinalIgnoreCase);
-        var installedSdks = new HashSet<string>(inventory.DotNetSdks, StringComparer.OrdinalIgnoreCase);
-        if (!requestedSdks.SetEquals(installedSdks))
-        {
-            return "The built image did not contain exactly the pinned .NET SDK versions.";
-        }
-
-        if (request.Packages.Count != inventory.Packages.Count)
-        {
-            return "The built image did not contain exactly the pinned package set.";
-        }
-
-        foreach (var package in request.Packages)
-        {
-            if (!inventory.Packages.TryGetValue(package.Key, out var installedVersion)
-                || !installedVersion.Equals(package.Value, StringComparison.OrdinalIgnoreCase))
-            {
-                return $"The built image did not contain the pinned version of package '{package.Key}'.";
-            }
-        }
-
-        return null;
-    }
-
-    private static RunnerImageInventory Freeze(RunnerImageInventory inventory)
-    {
-        return inventory with
-        {
-            DotNetSdks = FreezeSdks(inventory.DotNetSdks),
-            Packages = FreezePackages(inventory.Packages)
-        };
-    }
-
-    private static RunnerImageBuildRequest Freeze(RunnerImageBuildRequest request)
-    {
-        return request with
-        {
-            DotNetSdks = FreezeSdks(request.DotNetSdks),
-            Packages = FreezePackages(request.Packages)
-        };
-    }
-
-    private static IReadOnlyList<string> FreezeSdks(IReadOnlyList<string> sdks)
-    {
-        return Array.AsReadOnly(sdks.ToArray());
-    }
-
-    private static IReadOnlyDictionary<string, string> FreezePackages(
-        IReadOnlyDictionary<string, string> packages)
-    {
-        return new ReadOnlyDictionary<string, string>(
-            new Dictionary<string, string>(packages, StringComparer.OrdinalIgnoreCase));
     }
 
     private sealed record QueuedBuild(string Version, RunnerImageBuildRequest Request);

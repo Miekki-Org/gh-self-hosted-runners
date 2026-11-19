@@ -2,6 +2,8 @@ namespace RunnerControlPlane.Images;
 
 public sealed class RunnerImageBuildOptions
 {
+    public string StateFilePath { get; set; } = "";
+    public string WorkloadClientId { get; set; } = "";
     public bool RoutineBuildEnabled { get; set; }
     public string RoutineBuildDayUtc { get; set; } = "Sunday";
     public string RoutineBuildTimeUtc { get; set; } = "03:00";

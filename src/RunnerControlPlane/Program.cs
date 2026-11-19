@@ -110,7 +110,7 @@ builder.Services.AddHttpClient<IGitHubRunnerCapacityClient, GitHubRunnerCapacity
 
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
-builder.Services.AddSingleton<IRunnerImageStore, InMemoryRunnerImageStore>();
+builder.Services.AddSingleton<IRunnerImageStore, JsonRunnerImageStore>();
 builder.Services.AddSingleton<IRunnerImageRolloutStore, InMemoryRunnerImageRolloutStore>();
 builder.Services.AddSingleton<IRunnerImageRolloutService, RunnerImageRolloutService>();
 builder.Services.AddSingleton<IRunnerVmStore, InMemoryRunnerVmStore>();
@@ -138,6 +138,7 @@ builder.Services.AddHostedService<RunnerImageScheduleWorker>();
 
 const string requestAuthenticationScheme = "request";
 const string entraAuthenticationScheme = "entra";
+const string reportRunnerImageBuildPolicy = "ReportRunnerImageBuildResult";
 
 builder.Services
     .AddAuthentication(options =>
@@ -256,6 +257,24 @@ builder.Services.AddAuthorization(options =>
             var entraOptions = httpContext.RequestServices
                 .GetRequiredService<Microsoft.Extensions.Options.IOptions<EntraOptions>>().Value;
             return HasGroup(context.User, entraOptions.OperatorGroupId);
+        });
+    });
+    options.AddPolicy(reportRunnerImageBuildPolicy, policy =>
+    {
+        policy.RequireAuthenticatedUser();
+        policy.RequireAssertion(context =>
+        {
+            if (context.Resource is not HttpContext httpContext)
+            {
+                return false;
+            }
+
+            var entraOptions = httpContext.RequestServices
+                .GetRequiredService<Microsoft.Extensions.Options.IOptions<EntraOptions>>().Value;
+            var buildOptions = httpContext.RequestServices
+                .GetRequiredService<Microsoft.Extensions.Options.IOptions<RunnerImageBuildOptions>>().Value;
+            return HasGroup(context.User, entraOptions.OperatorGroupId)
+                || HasRunnerImageBuildWorkload(context.User, buildOptions.WorkloadClientId);
         });
     });
 });
@@ -565,7 +584,8 @@ app.MapGet("/api/runner-images/{version}", (string version, IRunnerImageStore im
 
 app.MapPost("/api/runner-images", (
         RunnerImageBuildRequest? request,
-        IRunnerImageBuildQueue queue) =>
+        ClaimsPrincipal user,
+        IRunnerImageStore images) =>
     {
         var validationError = RunnerImageRequestValidator.Validate(request);
         if (validationError is not null)
@@ -573,10 +593,40 @@ app.MapPost("/api/runner-images", (
             return Results.BadRequest(new { error = validationError });
         }
 
-        var image = queue.Queue(request!);
+        var image = images.RegisterBuild(
+            request!,
+            RunnerImageManifest.ComputeDigest(request!),
+            GetActor(user));
         return Results.Accepted($"/api/runner-images/{image.Version}", image);
     })
     .RequireAuthorization(AccessPolicies.CanManage);
+
+app.MapPost("/api/runner-images/{version}/result", (
+        string version,
+        RunnerImageBuildResult? result,
+        ClaimsPrincipal user,
+        IRunnerImageStore images) =>
+    {
+        if (result is null
+            || string.IsNullOrWhiteSpace(result.ManifestDigest)
+            || result.Inventory is null
+            || result.Validation is null)
+        {
+            return Results.BadRequest(new { error = "Provide a manifest digest, image inventory, and validation results." });
+        }
+
+        var submission = images.ReportBuildResult(version, result, GetActor(user));
+        return submission.Status switch
+        {
+            RunnerImageBuildResultStatus.Recorded or RunnerImageBuildResultStatus.Idempotent =>
+                Results.Ok(submission.Image),
+            RunnerImageBuildResultStatus.NotFound => Results.NotFound(),
+            RunnerImageBuildResultStatus.ConflictingRetry =>
+                Results.Conflict(new { error = submission.Error }),
+            _ => Results.BadRequest(new { error = submission.Error })
+        };
+    })
+    .RequireAuthorization(reportRunnerImageBuildPolicy);
 
 app.MapGet("/api/runner-vm", (IRunnerVmStore runnerVms) => Results.Ok(runnerVms.List()))
     .RequireAuthorization(AccessPolicies.CanView);
@@ -782,6 +832,15 @@ static bool HasGroup(ClaimsPrincipal user, string groupId)
 {
     return !string.IsNullOrWhiteSpace(groupId)
         && user.FindAll("groups").Any(claim => claim.Value.Equals(groupId, StringComparison.OrdinalIgnoreCase));
+}
+
+static bool HasRunnerImageBuildWorkload(ClaimsPrincipal user, string clientId)
+{
+    return !string.IsNullOrWhiteSpace(clientId)
+        && user.FindFirst("idtyp")?.Value.Equals("app", StringComparison.OrdinalIgnoreCase) == true
+        && !user.HasClaim(claim => claim.Type == "scp")
+        && user.FindAll("azp").Concat(user.FindAll("appid"))
+            .Any(claim => claim.Value.Equals(clientId, StringComparison.OrdinalIgnoreCase));
 }
 
 static RunnerAccessResponse ToResponse(

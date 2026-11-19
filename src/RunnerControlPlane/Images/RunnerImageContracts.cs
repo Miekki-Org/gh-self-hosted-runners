@@ -33,6 +33,20 @@ public sealed record RunnerImageValidationResult(
         ImageChecksPassed && VmBooted && GitHubRunnerRegistered && SampleDotNetBuildPassed;
 }
 
+public sealed record RunnerImageBuildResult(
+    string ManifestDigest,
+    string AzureImageId,
+    RunnerImageInventory Inventory,
+    RunnerImageValidationResult Validation,
+    bool Succeeded,
+    string? FailureReason = null);
+
+public sealed record RunnerImageBuildAuditRecord(
+    string Actor,
+    DateTimeOffset Timestamp,
+    string Action,
+    string Outcome);
+
 public sealed record RunnerImage(
     string Version,
     DateTimeOffset RequestedAt,
@@ -40,7 +54,30 @@ public sealed record RunnerImage(
     RunnerImageBuildRequest BuildRequest,
     RunnerImageBuildStatus Status,
     RunnerImageInventory? Inventory,
-    string? FailureReason);
+    string? FailureReason,
+    string? ManifestDigest = null,
+    string? AzureImageId = null,
+    RunnerImageBuildResult? BuildResult = null,
+    IReadOnlyList<RunnerImageBuildAuditRecord>? AuditTrail = null)
+{
+    public string BuildId => Version;
+}
+
+public enum RunnerImageBuildResultStatus
+{
+    Recorded,
+    Idempotent,
+    NotFound,
+    ManifestMismatch,
+    InventoryMismatch,
+    ConflictingRetry,
+    Invalid
+}
+
+public sealed record RunnerImageBuildResultSubmission(
+    RunnerImageBuildResultStatus Status,
+    RunnerImage? Image,
+    string? Error);
 
 public sealed record RunnerImageArtifact(RunnerImageInventory Inventory);
 
@@ -64,6 +101,11 @@ public interface IRunnerImageStore
     IReadOnlyList<RunnerImage> List();
     IReadOnlyList<RunnerImage> ListAvailable();
     RunnerImage? Get(string version);
+    RunnerImage RegisterBuild(RunnerImageBuildRequest request, string manifestDigest, string actor);
+    RunnerImageBuildResultSubmission ReportBuildResult(
+        string version,
+        RunnerImageBuildResult result,
+        string actor);
     RunnerImage AddQueued(string version, RunnerImageBuildRequest request);
     void Update(string version, Func<RunnerImage, RunnerImage> update);
 }
