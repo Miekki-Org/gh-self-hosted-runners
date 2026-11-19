@@ -1,0 +1,14 @@
+{
+  "packages": {
+    "curl": [
+      {
+        "version": "8.5.0-2ubuntu10.6",
+        "repository": "ubuntu-noble-main"
+      },
+      {
+        "version": "8.5.0-2ubuntu10.7",
+        "repository": "ubuntu-noble-main"
+      }
+    ]
+  }
+}

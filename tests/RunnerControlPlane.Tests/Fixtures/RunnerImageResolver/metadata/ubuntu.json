@@ -1,0 +1,16 @@
+{
+  "releases": [
+    {
+      "version": "24.04",
+      "lts": true,
+      "supported": true,
+      "codename": "noble"
+    },
+    {
+      "version": "25.10",
+      "lts": false,
+      "supported": true,
+      "codename": "questing"
+    }
+  ]
+}

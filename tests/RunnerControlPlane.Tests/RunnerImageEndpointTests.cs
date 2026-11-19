@@ -80,6 +80,54 @@ public sealed class RunnerImageEndpointTests
     }
 
     [Fact]
+    public async Task OperatorCanRegisterAnImageBuildWithItsRunnerChecksum()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        const string runnerSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        var response = await client.PostAsJsonAsync(
+            "/api/runner-images",
+            new
+            {
+                ubuntuRelease = "24.04",
+                dotNetSdks = new[] { "10.0.101" },
+                packages = new { curl = "8.5.0-2ubuntu10.7" },
+                runnerVersion = "2.331.0",
+                runnerSha256
+            });
+        var registration = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.Equal(runnerSha256, registration!.BuildRequest.RunnerSha256);
+        Assert.Equal(
+            "434cf311fd065b45fc73eab677a957556d661af1588060a139033e97d693180a",
+            registration.ManifestDigest);
+    }
+
+    [Fact]
+    public async Task OperatorCannotRegisterAnImageBuildWithAnInvalidRunnerChecksum()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var response = await client.PostAsJsonAsync(
+            "/api/runner-images",
+            new
+            {
+                ubuntuRelease = "24.04",
+                dotNetSdks = new[] { "10.0.101" },
+                packages = new { curl = "8.5.0-2ubuntu10.7" },
+                runnerVersion = "2.331.0",
+                runnerSha256 = "not-a-sha256"
+            });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
     public async Task SuccessfulBuildResultMakesTheValidatedImageAvailable()
     {
         using var factory = new RunnerImageControlPlaneFactory();
@@ -320,10 +368,20 @@ public sealed class RunnerImageEndpointTests
                 new Dictionary<string, string> { ["curl"] = "8.5.1" },
                 "2.331.0"));
         var changedManifest = await changedManifestResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        var checksumResponse = await client.PostAsJsonAsync(
+            "/api/runner-images",
+            new RunnerImageBuildRequest(
+                "24.04",
+                ["8.0.404", "9.0.203"],
+                new Dictionary<string, string> { ["curl"] = "8.5.0" },
+                "2.331.0",
+                RunnerSha256: new string('a', 64)));
+        var checksumBuild = await checksumResponse.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
 
         Assert.NotEqual(firstBuild!.BuildId, secondBuild!.BuildId);
         Assert.Equal(firstBuild.ManifestDigest, secondBuild.ManifestDigest);
         Assert.NotEqual(firstBuild.ManifestDigest, changedManifest!.ManifestDigest);
+        Assert.NotEqual(firstBuild.ManifestDigest, checksumBuild!.ManifestDigest);
     }
 
     [Fact]

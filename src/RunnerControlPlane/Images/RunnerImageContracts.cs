@@ -14,7 +14,8 @@ public sealed record RunnerImageBuildRequest(
     IReadOnlyList<string> DotNetSdks,
     IReadOnlyDictionary<string, string> Packages,
     string RunnerVersion,
-    bool Expedited = false);
+    bool Expedited = false,
+    string? RunnerSha256 = null);
 
 public sealed record RunnerImageInventory(
     string UbuntuRelease,

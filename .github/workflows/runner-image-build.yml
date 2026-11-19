@@ -1,0 +1,75 @@
+name: Resolve and register Runner image build
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out approved manifest
+        uses: actions/checkout@v7.0.1
+
+      - name: Update approved Ubuntu package metadata
+        run: sudo apt-get update
+
+      - name: Resolve approved versions
+        run: >
+          dotnet run
+          --project src/RunnerImageManifestResolver/RunnerImageManifestResolver.csproj
+          --configuration Release
+          --
+          --manifest .github/runner-images/manifest.json
+          > "$RUNNER_TEMP/runner-image-resolved.json"
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Register resolved build
+        id: register
+        env:
+          RUNNER_IMAGE_API_URL: ${{ vars.RUNNER_IMAGE_API_URL }}
+          RUNNER_IMAGE_API_SCOPE: ${{ vars.RUNNER_IMAGE_API_SCOPE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          token="$(az account get-access-token \
+            --scope "$RUNNER_IMAGE_API_SCOPE" \
+            --query accessToken \
+            --output tsv)"
+          if [[ -z "$token" ]]; then
+            echo "::error::Azure did not return a control-plane API access token."
+            exit 1
+          fi
+          echo "::add-mask::$token"
+
+          resolved="$RUNNER_TEMP/runner-image-resolved.json"
+          api_url="${RUNNER_IMAGE_API_URL%/}"
+          response="$(curl --silent --show-error --fail-with-body \
+            --request POST \
+            --header "Authorization: Bearer $token" \
+            --header "Content-Type: application/json" \
+            --data-binary "$(jq -c '.request' "$resolved")" \
+            "$api_url/api/runner-images")"
+
+          build_id="$(jq -er '.buildId' <<< "$response")"
+          digest="$(jq -er '.manifestDigest' <<< "$response")"
+          expected_digest="$(jq -er '.manifestDigest' "$resolved")"
+          if [[ ! "$digest" =~ ^[a-f0-9]{64}$ || "$digest" != "$expected_digest" ]]; then
+            echo "::error::The control plane returned an invalid or mismatched manifest digest."
+            exit 1
+          fi
+
+          echo "build_id=$build_id" >> "$GITHUB_OUTPUT"
+          echo "manifest_digest=$digest" >> "$GITHUB_OUTPUT"

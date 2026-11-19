@@ -21,6 +21,13 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\RunnerControlPlane\RunnerControlPlane.csproj" />
+    <ProjectReference Include="..\..\src\RunnerImageManifestResolver\RunnerImageManifestResolver.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Fixtures\RunnerImageResolver\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

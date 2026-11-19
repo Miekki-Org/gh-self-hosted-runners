@@ -4,7 +4,7 @@ The control plane stores image-build registrations, callback results, inventorie
 
 ## API
 
-- `POST /api/runner-images` registers an external build and returns `202 Accepted` with its immutable `buildId` and SHA-256 `manifestDigest`. The body must pin `ubuntuRelease`, one or more `dotNetSdks`, package versions, and `runnerVersion`.
+- `POST /api/runner-images` registers an external build and returns `202 Accepted` with its immutable `buildId` and SHA-256 `manifestDigest`. The body must pin `ubuntuRelease`, one or more `dotNetSdks`, package versions, and `runnerVersion`; scheduled builds also include `runnerSha256`, which is validated and included in the manifest digest.
 - `POST /api/runner-images/{buildId}/result` records the build outcome. Submit the registered manifest digest, Azure image resource ID, exact image inventory, all four validation checks, and `succeeded` outcome. The API rejects a mismatched digest or inventory. Successful results are available only when every validation check passes; failed results retain their failure reason and do not replace available images. An identical retry is idempotent; a conflicting retry returns `409 Conflict`.
 - `GET /api/runner-images` lists build records.
 - `GET /api/runner-images/{buildId}` returns build status, manifest digest, result, inventory, and audit trail.
@@ -19,7 +19,8 @@ Example build request:
   "ubuntuRelease": "24.04",
   "dotNetSdks": ["8.0.404"],
   "packages": { "curl": "8.5.0" },
-  "runnerVersion": "2.331.0"
+  "runnerVersion": "2.331.0",
+  "runnerSha256": "<64-character SHA-256 checksum>"
 }
 ```
 
@@ -47,9 +48,19 @@ The result callback body has this shape:
 
 Set `RunnerImageBuild__WorkloadClientId` to the Entra application client ID (`azp` or `appid` claim) authorized to report results. Configure the API app registration to include the `idtyp` optional access-token claim; callbacks require `idtyp: "app"` and reject tokens with delegated `scp` claims. Operators can also report results using the normal operator group authorization.
 
-## Weekly builds
+## Scheduled and manual build registration
 
-Set `RunnerImageBuild__RoutineBuildEnabled` to `true`, and configure `RunnerImageBuild__RoutineBuildRequest` with the pinned manifest for the current approved repositories. The scheduler queues one routine build each week at `RunnerImageBuild__RoutineBuildDayUtc` and `RunnerImageBuild__RoutineBuildTimeUtc` (UTC). Routine builds are not expedited. Do not enable the schedule until the required versions and integrations are configured.
+`.github/workflows/runner-image-build.yml` runs weekly at 03:00 UTC on Sunday and can also be started with `workflow_dispatch`. It reads `.github/runner-images/manifest.json`, resolves the approved Ubuntu LTS, .NET SDK channels, package versions from the declared Ubuntu repositories, and latest GitHub Actions Runner release with its SHA-256 checksum. The resolver prints the pinned request, validation and retention policies, and the same manifest digest the control plane computes. Resolver tests use fixture metadata and do not call production Azure or external metadata services.
+
+Configure these repository variables before enabling or dispatching the workflow:
+
+- `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` for an Azure application configured with GitHub Actions OIDC federation.
+- `RUNNER_IMAGE_API_URL` for the deployed control plane.
+- `RUNNER_IMAGE_API_SCOPE` for the control-plane API's v2 `/.default` scope.
+
+The federated application must be authorized as a control-plane operator to register builds. No Azure client secret or long-lived credential is stored in the repository. The registration step exposes the returned build ID and manifest digest as `build_id` and `manifest_digest` step outputs, and fails if the control plane's digest differs from the locally resolved request.
+
+This workflow resolves and registers an external build; it does not provision the Azure image. The API's legacy in-process routine-build scheduler is separate and should remain disabled when this workflow is the registration source.
 
 ## Integration and storage
 

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "ubuntu": {
+    "channel": "latest-lts"
+  },
+  "dotNetSdks": [
+    "10.0"
+  ],
+  "packages": {
+    "curl": "ubuntu-main"
+  },
+  "repositories": [
+    {
+      "id": "ubuntu-main",
+      "uris": [
+        "http://archive.ubuntu.com/ubuntu",
+        "http://azure.archive.ubuntu.com/ubuntu",
+        "http://security.ubuntu.com/ubuntu"
+      ],
+      "suites": [
+        "{ubuntuCodename}",
+        "{ubuntuCodename}-updates",
+        "{ubuntuCodename}-security"
+      ],
+      "components": [
+        "main",
+        "universe"
+      ]
+    }
+  ],
+  "runner": {
+    "repository": "actions/runner",
+    "channel": "latest"
+  },
+  "validation": {
+    "checks": [
+      "image",
+      "vm-boot",
+      "runner-registration",
+      "sample-dotnet-build",
+      "health-window"
+    ],
+    "healthWindowMinutes": 15
+  },
+  "retention": {
+    "keepCurrent": true,
+    "previousValidated": 2
+  }
+}

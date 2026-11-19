@@ -19,6 +19,13 @@ public static class RunnerImageRequestValidator
             return "Provide a pinned GitHub Actions Runner version.";
         }
 
+        if (request.RunnerSha256 is not null
+            && (request.RunnerSha256.Length != 64
+                || request.RunnerSha256.Any(character => !Uri.IsHexDigit(character))))
+        {
+            return "Provide a valid SHA-256 checksum for the GitHub Actions Runner release.";
+        }
+
         if (request.DotNetSdks is null
             || request.DotNetSdks.Count == 0
             || request.DotNetSdks.Any(version => !IsPinnedVersion(version))

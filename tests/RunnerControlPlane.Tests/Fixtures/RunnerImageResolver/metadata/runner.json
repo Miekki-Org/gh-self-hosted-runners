@@ -1,0 +1,9 @@
+{
+  "tag_name": "v2.331.0",
+  "assets": [
+    {
+      "name": "actions-runner-linux-x64-2.331.0.tar.gz",
+      "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  ]
+}

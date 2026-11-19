@@ -16,7 +16,8 @@ public static class RunnerImageManifest
             Packages = request.Packages
                 .OrderBy(package => package.Key, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(package => package.Key, package => package.Value, StringComparer.OrdinalIgnoreCase),
-            request.RunnerVersion
+            request.RunnerVersion,
+            request.RunnerSha256
         };
         return Convert.ToHexStringLower(
             SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions)));
