@@ -20,6 +20,7 @@ using RunnerControlPlane.RunnerCapacity;
 
 namespace RunnerControlPlane.Tests;
 
+[Collection("Runner access startup")]
 public sealed class RunnerAccessEndpointTests
 {
     [Fact]
@@ -294,6 +295,9 @@ public sealed class RunnerAccessEndpointTests
         Assert.NotNull(exception);
         Assert.Contains("Entra:ReadOnlyGroupId and Entra:OperatorGroupId must be different", exception.ToString());
     }
+
+    [CollectionDefinition("Runner access startup", DisableParallelization = true)]
+    public sealed class RunnerAccessStartupCollection;
 
     private sealed class RunnerControlPlaneFactory : WebApplicationFactory<Program>
     {

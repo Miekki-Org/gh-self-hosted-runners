@@ -118,6 +118,57 @@ public sealed class RunnerImageWorkflowTests
         Assert.Equal(2, Count(result.Error, "CURL_URL="));
     }
 
+    [Theory]
+    [InlineData("", true)]
+    [InlineData("sleep infinity", false)]
+    public async Task DeploymentClearsMaintenanceCommandBeforeStarting(string startup, bool shouldStart)
+    {
+        var workflow = File.ReadAllText(Path.Combine(Root, ".github/workflows/deploy-control-plane.yml"));
+        var step = workflow.Split("      - name: Deploy tested artifact through maintenance mode\n", StringSplitOptions.None)[1];
+        var script = step.Split("        run: |\n", StringSplitOptions.None)[1]
+            .Split("      - name:", StringSplitOptions.None)[0];
+        script = string.Join('\n', script.Split('\n').Select(line =>
+            line.StartsWith("          ", StringComparison.Ordinal) ? line[10..] : line));
+        const string mocks = """
+            az() {
+              printf 'az %s\n' "$*" >&2
+              case "$1 $2" in
+                'webapp show')
+                  if [[ "$*" == *'--query state'* ]]; then echo Stopped; else echo /subscriptions/test/resourceGroups/rg/providers/Microsoft.Web/sites/app; fi ;;
+                'webapp config') printf '"%s"\n' "$MOCK_STARTUP" ;;
+                'rest --method')
+                  [[ "$3" == patch && "$*" == *'/config/web?api-version=2023-12-01'* ]] || return 1
+                  [[ "$*" == *'{"properties":{"appCommandLine":""}}'* ]] || return 1 ;;
+              esac
+            }
+            """;
+        var start = new ProcessStartInfo("bash")
+        {
+            WorkingDirectory = Root,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        start.ArgumentList.Add("-c");
+        start.ArgumentList.Add(mocks + "\n" + script);
+        start.Environment["AZURE_RESOURCE_GROUP"] = "rg";
+        start.Environment["AZURE_WEBAPP_NAME"] = "app";
+        start.Environment["MOCK_STARTUP"] = startup;
+        using var process = Process.Start(start)!;
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        var output = await stdout;
+        var error = await stderr;
+        Assert.Equal(shouldStart, process.ExitCode == 0);
+        Assert.Contains("az rest --method patch", error);
+        Assert.Contains("{\"properties\":{\"appCommandLine\":\"\"}}", error);
+        Assert.Equal(shouldStart ? 2 : 1, Count(error, "az webapp start"));
+        if (shouldStart)
+            Assert.True(error.IndexOf("az webapp config show", StringComparison.Ordinal) < error.LastIndexOf("az webapp start", StringComparison.Ordinal));
+        else
+            Assert.Contains("Maintenance startup command was not cleared", output);
+    }
+
     private static JsonObject Resource() => new()
     {
         ["id"] = $"/subscriptions/{Subscription}/resourceGroups/example/providers/Microsoft.Web/sites/myapp",

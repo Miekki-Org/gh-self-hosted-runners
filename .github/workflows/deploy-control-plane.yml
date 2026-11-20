@@ -172,7 +172,13 @@ jobs:
           az webapp deploy -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --src-path release/control-plane.zip --type zip --restart false --track-status false --output none
           az webapp stop -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
           [[ "$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query state -o tsv)" == "Stopped" ]] || { echo "::error::Could not stop maintenance mode."; exit 1; }
-          az webapp config set -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --startup-file "" --output none
+          app_id="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query id -o tsv)"
+          az rest --method patch --url "https://management.azure.com${app_id}/config/web?api-version=2023-12-01" \
+            --body '{"properties":{"appCommandLine":""}}' --output none
+          if ! az webapp config show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query appCommandLine -o json | jq -e '. == ""' >/dev/null; then
+            echo "::error::Maintenance startup command was not cleared; app remains stopped."
+            exit 1
+          fi
           az webapp start -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
       - name: Check HTTPS API response
         shell: bash
