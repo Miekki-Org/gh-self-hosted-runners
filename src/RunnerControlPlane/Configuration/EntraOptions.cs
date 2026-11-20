@@ -8,4 +8,5 @@ public sealed class EntraOptions
     public string ReadOnlyGroupId { get; set; } = "";
     public string OperatorGroupId { get; set; } = "";
     public string ApiAudience { get; set; } = "";
+    public string PublicBaseUrl { get; set; } = "";
 }

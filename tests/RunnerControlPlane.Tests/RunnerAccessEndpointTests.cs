@@ -4,9 +4,11 @@ using System.Security.Claims;
 using System.Text.Json;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -63,6 +65,94 @@ public sealed class RunnerAccessEndpointTests
             .Get(JwtBearerDefaults.AuthenticationScheme);
 
         Assert.Equal("api://client-id", options.Audience);
+    }
+
+    [Fact]
+    public async Task LoginUsesConfiguredPublicHttpsOriginInsteadOfRequestHost()
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["Entra:PublicBaseUrl"] = "https://runners.example.com:8443"
+            });
+        using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+            BaseAddress = new Uri("http://internal.test")
+        });
+        client.DefaultRequestHeaders.Host = "hostile.example";
+        client.DefaultRequestHeaders.Add("X-Forwarded-Host", "forwarded-hostile.example");
+        client.DefaultRequestHeaders.Add("X-Forwarded-Proto", "https");
+
+        var response = await client.GetAsync("/login");
+
+        Assert.True(response.StatusCode == HttpStatusCode.Redirect, await response.Content.ReadAsStringAsync());
+        var query = QueryHelpers.ParseQuery(response.Headers.Location!.Query);
+        Assert.Equal("https://runners.example.com:8443/signin-oidc", query["redirect_uri"].ToString());
+    }
+
+    [Theory]
+    [InlineData(null, "http://internal.test/signin-oidc")]
+    [InlineData("", "http://internal.test/signin-oidc")]
+    [InlineData("https://runners.example.com/", "https://runners.example.com/signin-oidc")]
+    public async Task LoginUsesExistingRedirectWhenPublicOriginIsUnsetOrAcceptsTrailingSlash(
+        string? publicBaseUrl,
+        string expectedRedirect)
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?> { ["Entra:PublicBaseUrl"] = publicBaseUrl });
+        using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+            BaseAddress = new Uri("http://internal.test")
+        });
+
+        var response = await client.GetAsync("/login");
+
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.Equal(expectedRedirect, QueryHelpers.ParseQuery(response.Headers.Location!.Query)["redirect_uri"].ToString());
+    }
+
+    [Fact]
+    public async Task LogoutUsesConfiguredPublicHttpsOriginInsteadOfRequestHost()
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?> { ["Entra:PublicBaseUrl"] = "https://runners.example.com" });
+        using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+            BaseAddress = new Uri("http://internal.test")
+        });
+        client.DefaultRequestHeaders.Host = "hostile.example";
+
+        var response = await client.PostAsync("/logout", null);
+
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.Equal("https://runners.example.com/signout-callback-oidc",
+            QueryHelpers.ParseQuery(response.Headers.Location!.Query)["post_logout_redirect_uri"].ToString());
+    }
+
+    [Theory]
+    [InlineData("http://runners.example.com")]
+    [InlineData("runners.example.com")]
+    [InlineData("https://user@runners.example.com")]
+    [InlineData("https://runners.example.com/path")]
+    [InlineData("https://runners.example.com/path/..")]
+    [InlineData("https://runners.example.com?query")]
+    [InlineData("https://runners.example.com?")]
+    [InlineData("https://runners.example.com#fragment")]
+    [InlineData("https://runners.example.com#")]
+    [InlineData("https://runners.example.com\\path")]
+    [InlineData(" ")]
+    public void InvalidPublicOriginIsRejectedAtStartup(string publicBaseUrl)
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?> { ["Entra:PublicBaseUrl"] = publicBaseUrl });
+
+        var exception = Record.Exception(() => factory.CreateClient());
+
+        Assert.NotNull(exception);
+        Assert.Contains("Entra:PublicBaseUrl must be an absolute HTTPS origin", exception.ToString());
     }
 
     [Fact]
@@ -246,6 +336,13 @@ public sealed class RunnerAccessEndpointTests
 
             builder.ConfigureTestServices(services =>
             {
+                services.PostConfigure<OpenIdConnectOptions>("entra", options =>
+                    options.ConfigurationManager = new Microsoft.IdentityModel.Protocols.StaticConfigurationManager<Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration>(
+                        new Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration
+                        {
+                            AuthorizationEndpoint = "https://login.example.test/authorize",
+                            EndSessionEndpoint = "https://login.example.test/logout"
+                        }));
                 services.RemoveAll<IGitHubRunnerCapacityClient>();
                 services.AddSingleton<IGitHubRunnerCapacityClient, TestGitHubRunnerCapacityClient>();
                 services.RemoveAll<IGitHubRunnerGroupClient>();

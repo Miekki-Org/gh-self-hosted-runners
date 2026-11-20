@@ -80,6 +80,60 @@ public sealed class RunnerImageEndpointTests
     }
 
     [Fact]
+    public async Task ConfiguredWorkloadIdentityCanRegisterAScheduledImageBuild()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "image-builder");
+
+        var response = await RequestBuildAsync(client, expedited: false);
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var registration = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        Assert.NotNull(registration);
+        Assert.False(registration.Expedited);
+        Assert.False(string.IsNullOrWhiteSpace(registration.BuildId));
+        Assert.Matches("^[a-f0-9]{64}$", registration.ManifestDigest);
+    }
+
+    [Theory]
+    [InlineData("operator", HttpStatusCode.Accepted)]
+    [InlineData("reader", HttpStatusCode.Forbidden)]
+    [InlineData("wrong-image-builder", HttpStatusCode.Forbidden)]
+    [InlineData("delegated-image-builder", HttpStatusCode.Forbidden)]
+    [InlineData("scoped-image-builder", HttpStatusCode.Forbidden)]
+    [InlineData("missing-idtyp-image-builder", HttpStatusCode.Forbidden)]
+    [InlineData("appid-image-builder", HttpStatusCode.Accepted)]
+    public async Task ScheduledImageBuildRegistrationRequiresOperatorOrConfiguredAppOnlyIdentity(
+        string role,
+        HttpStatusCode expectedStatus)
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", role);
+
+        var response = await RequestBuildAsync(client, expedited: false);
+
+        Assert.Equal(expectedStatus, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task WorkloadIdentityCannotManageOtherResources()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "image-builder");
+
+        var rollout = await client.PostAsJsonAsync("/api/runner-images/rollout", new { imageVersion = "image" });
+        var capacity = await client.PostAsJsonAsync("/api/runner-capacity/scale-out", new { count = 1 });
+        var vm = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("image"));
+
+        Assert.Equal(HttpStatusCode.Forbidden, rollout.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, capacity.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, vm.StatusCode);
+    }
+
+    [Fact]
     public async Task OperatorCanRegisterAnImageBuildWithItsRunnerChecksum()
     {
         using var factory = new RunnerImageControlPlaneFactory();
@@ -694,6 +748,26 @@ public sealed class RunnerImageEndpointTests
                 [
                     new Claim("azp", "image-builder-client"),
                     new Claim("idtyp", "app")
+                ],
+                "appid-image-builder" =>
+                [
+                    new Claim("appid", "image-builder-client"),
+                    new Claim("idtyp", "app")
+                ],
+                "wrong-image-builder" =>
+                [
+                    new Claim("azp", "other-client"),
+                    new Claim("idtyp", "app")
+                ],
+                "missing-idtyp-image-builder" =>
+                [
+                    new Claim("azp", "image-builder-client")
+                ],
+                "scoped-image-builder" =>
+                [
+                    new Claim("azp", "image-builder-client"),
+                    new Claim("idtyp", "app"),
+                    new Claim("scp", "image.result")
                 ],
                 "delegated-image-builder" =>
                 [

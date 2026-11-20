@@ -11,7 +11,9 @@ permissions:
 
 jobs:
   register:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: production
     steps:
       - name: Check out approved manifest
         uses: actions/checkout@v7.0.1
@@ -38,11 +40,42 @@ jobs:
       - name: Register resolved build
         id: register
         env:
-          RUNNER_IMAGE_API_URL: ${{ vars.RUNNER_IMAGE_API_URL }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           RUNNER_IMAGE_API_SCOPE: ${{ vars.RUNNER_IMAGE_API_SCOPE }}
         shell: bash
         run: |
           set -euo pipefail
+
+          if [[ ! "$AZURE_SUBSCRIPTION_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
+             [[ ! "$AZURE_RESOURCE_GROUP" =~ ^[a-zA-Z0-9_().-]{1,90}$ || "$AZURE_RESOURCE_GROUP" == *. ]] ||
+             [[ ! "$AZURE_WEBAPP_NAME" =~ ^[a-zA-Z0-9-]{1,60}$ ]] ||
+             [[ -z "$RUNNER_IMAGE_API_SCOPE" ]]; then
+            echo "::error::Azure resource settings and the control-plane API scope must be valid and nonempty."
+            exit 1
+          fi
+
+          app="$(az webapp show \
+            --subscription "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --output json)"
+          expected_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP/providers/Microsoft.Web/sites/$AZURE_WEBAPP_NAME"
+          hostname="$(jq -er --arg expected_id "$expected_id" '
+            select((.id | type == "string") and
+                   (.id | ascii_downcase) == ($expected_id | ascii_downcase) and
+                   (.type | type == "string" and ascii_downcase == "microsoft.web/sites") and
+                   (.state | type == "string" and ascii_downcase == "running")) |
+            .defaultHostName |
+            select(type == "string") |
+            ascii_downcase |
+            select(test("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\\.azurewebsites\\.net$"))
+          ' <<< "$app")" || {
+            echo "::error::Azure did not return the expected running App Service and a valid default hostname."
+            exit 1
+          }
+          api_url="https://$hostname"
 
           token="$(az account get-access-token \
             --scope "$RUNNER_IMAGE_API_SCOPE" \
@@ -55,13 +88,32 @@ jobs:
           echo "::add-mask::$token"
 
           resolved="$RUNNER_TEMP/runner-image-resolved.json"
-          api_url="${RUNNER_IMAGE_API_URL%/}"
+          readiness_status="$(curl --silent --show-error \
+            --proto '=https' --max-time 30 \
+            --output /dev/null --write-out '%{http_code}' \
+            --oauth2-bearer "$token" \
+            "$api_url/api/runner-images")"
+          # A valid app-only token may be forbidden from the group-protected GET.
+          # Registration itself is the authoritative workload authorization check.
+          if [[ "$readiness_status" != 200 && "$readiness_status" != 403 ]]; then
+            echo "::error::The authenticated control-plane readiness check failed (HTTP $readiness_status)."
+            exit 1
+          fi
+
           response="$(curl --silent --show-error --fail-with-body \
+            --proto '=https' --max-time 30 \
             --request POST \
             --header "Authorization: Bearer $token" \
             --header "Content-Type: application/json" \
             --data-binary "$(jq -c '.request' "$resolved")" \
+            --write-out $'\n%{http_code}' \
             "$api_url/api/runner-images")"
+          status="${response##*$'\n'}"
+          response="${response%$'\n'*}"
+          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "::error::The control plane rejected the build registration (HTTP $status)."
+            exit 1
+          fi
 
           build_id="$(jq -er '.buildId' <<< "$response")"
           digest="$(jq -er '.manifestDigest' <<< "$response")"
