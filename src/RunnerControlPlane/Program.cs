@@ -25,6 +25,9 @@ builder.Services
     .Validate(options => !string.IsNullOrWhiteSpace(options.ReadOnlyGroupId), "Entra:ReadOnlyGroupId is required.")
     .Validate(options => !string.IsNullOrWhiteSpace(options.OperatorGroupId), "Entra:OperatorGroupId is required.")
     .Validate(
+        options => string.IsNullOrEmpty(options.PublicBaseUrl) || IsHttpsOrigin(options.PublicBaseUrl),
+        "Entra:PublicBaseUrl must be an absolute HTTPS origin without userinfo, path, query, or fragment.")
+    .Validate(
         options => string.IsNullOrWhiteSpace(options.ReadOnlyGroupId)
             || string.IsNullOrWhiteSpace(options.OperatorGroupId)
             || !options.ReadOnlyGroupId.Equals(options.OperatorGroupId, StringComparison.OrdinalIgnoreCase),
@@ -138,6 +141,7 @@ builder.Services.AddHostedService<RunnerImageScheduleWorker>();
 
 const string requestAuthenticationScheme = "request";
 const string entraAuthenticationScheme = "entra";
+const string registerRunnerImageBuildPolicy = "RegisterRunnerImageBuild";
 const string reportRunnerImageBuildPolicy = "ReportRunnerImageBuildResult";
 
 builder.Services
@@ -211,6 +215,19 @@ builder.Services
         options.Scope.Add("openid");
         options.Scope.Add("profile");
         options.TokenValidationParameters.NameClaimType = "name";
+        if (!string.IsNullOrEmpty(entra.PublicBaseUrl))
+        {
+            options.Events.OnRedirectToIdentityProvider = context =>
+            {
+                context.ProtocolMessage.RedirectUri = entra.PublicBaseUrl.TrimEnd('/') + context.Options.CallbackPath;
+                return Task.CompletedTask;
+            };
+            options.Events.OnRedirectToIdentityProviderForSignOut = context =>
+            {
+                context.ProtocolMessage.PostLogoutRedirectUri = entra.PublicBaseUrl.TrimEnd('/') + context.Options.SignedOutCallbackPath;
+                return Task.CompletedTask;
+            };
+        }
     });
 
 builder.Services
@@ -257,6 +274,24 @@ builder.Services.AddAuthorization(options =>
             var entraOptions = httpContext.RequestServices
                 .GetRequiredService<Microsoft.Extensions.Options.IOptions<EntraOptions>>().Value;
             return HasGroup(context.User, entraOptions.OperatorGroupId);
+        });
+    });
+    options.AddPolicy(registerRunnerImageBuildPolicy, policy =>
+    {
+        policy.RequireAuthenticatedUser();
+        policy.RequireAssertion(context =>
+        {
+            if (context.Resource is not HttpContext httpContext)
+            {
+                return false;
+            }
+
+            var entraOptions = httpContext.RequestServices
+                .GetRequiredService<Microsoft.Extensions.Options.IOptions<EntraOptions>>().Value;
+            var buildOptions = httpContext.RequestServices
+                .GetRequiredService<Microsoft.Extensions.Options.IOptions<RunnerImageBuildOptions>>().Value;
+            return HasGroup(context.User, entraOptions.OperatorGroupId)
+                || HasRunnerImageBuildWorkload(context.User, buildOptions.WorkloadClientId);
         });
     });
     options.AddPolicy(reportRunnerImageBuildPolicy, policy =>
@@ -599,7 +634,7 @@ app.MapPost("/api/runner-images", (
             GetActor(user));
         return Results.Accepted($"/api/runner-images/{image.Version}", image);
     })
-    .RequireAuthorization(AccessPolicies.CanManage);
+    .RequireAuthorization(registerRunnerImageBuildPolicy);
 
 app.MapPost("/api/runner-images/{version}/result", (
         string version,
@@ -832,6 +867,22 @@ static bool HasGroup(ClaimsPrincipal user, string groupId)
 {
     return !string.IsNullOrWhiteSpace(groupId)
         && user.FindAll("groups").Any(claim => claim.Value.Equals(groupId, StringComparison.OrdinalIgnoreCase));
+}
+
+static bool IsHttpsOrigin(string value)
+{
+    if (!value.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+        || !Uri.TryCreate(value, UriKind.Absolute, out var uri)
+        || !uri.IsWellFormedOriginalString()
+        || uri.Scheme != Uri.UriSchemeHttps
+        || string.IsNullOrEmpty(uri.Host)
+        || value.IndexOfAny(['@', '?', '#', '\\']) >= 0)
+    {
+        return false;
+    }
+
+    var pathStart = value.IndexOf('/', "https://".Length);
+    return pathStart < 0 || pathStart == value.Length - 1;
 }
 
 static bool HasRunnerImageBuildWorkload(ClaimsPrincipal user, string clientId)

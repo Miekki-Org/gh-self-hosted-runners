@@ -1,0 +1,198 @@
+name: Deploy Runner Control Plane
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: control-plane-production
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-dotnet@v6.1.0
+        with:
+          dotnet-version: 10.0.x
+      - name: Build and test
+        run: |
+          set -euo pipefail
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+          dotnet restore RunnerControlPlane.sln
+          dotnet build RunnerControlPlane.sln --configuration Release --no-restore --nologo
+          dotnet test RunnerControlPlane.sln --configuration Release --no-build --nologo
+          dotnet publish src/RunnerControlPlane/RunnerControlPlane.csproj --configuration Release --no-build --output release/control-plane
+          (cd release/control-plane && zip -qr ../control-plane.zip .)
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: control-plane-${{ github.sha }}
+          path: release/control-plane.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    needs: release
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_APP_SERVICE_PLAN_NAME: ${{ vars.AZURE_APP_SERVICE_PLAN_NAME }}
+      AZURE_IDENTITY_NAME: ${{ vars.AZURE_IDENTITY_NAME }}
+      AZURE_KEY_VAULT_NAME: ${{ vars.AZURE_KEY_VAULT_NAME }}
+      AZURE_KEY_VAULT_RESOURCE_GROUP: ${{ vars.AZURE_KEY_VAULT_RESOURCE_GROUP }}
+      ENTRA_SECRET_NAME: ${{ vars.ENTRA_SECRET_NAME }}
+      GITHUB_TOKEN_SECRET_NAME: ${{ vars.GITHUB_TOKEN_SECRET_NAME }}
+      ENTRA_TENANT_ID: ${{ vars.ENTRA_TENANT_ID }}
+      ENTRA_CLIENT_ID: ${{ vars.ENTRA_CLIENT_ID }}
+      ENTRA_API_AUDIENCE: ${{ vars.ENTRA_API_AUDIENCE }}
+      ENTRA_READ_ONLY_GROUP_ID: ${{ vars.ENTRA_READ_ONLY_GROUP_ID }}
+      ENTRA_OPERATOR_GROUP_ID: ${{ vars.ENTRA_OPERATOR_GROUP_ID }}
+      GITHUB_ORGANIZATION: ${{ vars.GITHUB_ORGANIZATION }}
+      GITHUB_RUNNER_GROUP_ID: ${{ vars.GITHUB_RUNNER_GROUP_ID }}
+      RUNNER_LABEL: ${{ vars.RUNNER_LABEL }}
+      AZURE_VMSS_ENABLED: ${{ vars.AZURE_VMSS_ENABLED }}
+      AZURE_VMSS_RESOURCE_GROUP: ${{ vars.AZURE_VMSS_RESOURCE_GROUP }}
+      AZURE_VMSS_NAME: ${{ vars.AZURE_VMSS_NAME }}
+      AZURE_VMSS_ROLE_DEFINITION_ID: ${{ vars.AZURE_VMSS_ROLE_DEFINITION_ID }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: control-plane-${{ github.sha }}
+          path: release
+      - name: Sign in with production OIDC identity
+        uses: azure/login@v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Validate inputs and existing topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in AZURE_RESOURCE_GROUP AZURE_WEBAPP_NAME AZURE_SUBSCRIPTION_ID AZURE_CLIENT_ID AZURE_APP_SERVICE_PLAN_NAME AZURE_IDENTITY_NAME AZURE_KEY_VAULT_NAME AZURE_KEY_VAULT_RESOURCE_GROUP ENTRA_SECRET_NAME GITHUB_TOKEN_SECRET_NAME ENTRA_TENANT_ID ENTRA_CLIENT_ID ENTRA_API_AUDIENCE ENTRA_READ_ONLY_GROUP_ID ENTRA_OPERATOR_GROUP_ID GITHUB_ORGANIZATION GITHUB_RUNNER_GROUP_ID; do
+            if [[ -z "$(printenv "$name")" ]]; then
+              echo "::error::Missing production environment variable $name."
+              exit 1
+            fi
+          done
+          [[ "$GITHUB_RUNNER_GROUP_ID" =~ ^[1-9][0-9]*$ ]] || { echo "::error::GITHUB_RUNNER_GROUP_ID must be positive."; exit 1; }
+          [[ "$AZURE_WEBAPP_NAME" =~ ^[A-Za-z0-9-]{2,60}$ ]] || { echo "::error::AZURE_WEBAPP_NAME is invalid."; exit 1; }
+          [[ "${AZURE_VMSS_ENABLED:-false}" == "false" || "$AZURE_VMSS_ENABLED" == "true" ]] || { echo "::error::AZURE_VMSS_ENABLED must be true or false."; exit 1; }
+          if [[ "${AZURE_VMSS_ENABLED:-false}" == "true" ]]; then
+            [[ -n "$AZURE_VMSS_RESOURCE_GROUP" && -n "$AZURE_VMSS_NAME" && -n "$AZURE_VMSS_ROLE_DEFINITION_ID" ]] || { echo "::error::VMSS resource group, name and custom role ID are required."; exit 1; }
+          fi
+          apps="$(az webapp list --resource-group "$AZURE_RESOURCE_GROUP" --output json)"
+          plan_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP/providers/Microsoft.Web/serverfarms/$AZURE_APP_SERVICE_PLAN_NAME"
+          if ! jq -e --arg id "$plan_id" --arg name "$AZURE_WEBAPP_NAME" '[.[] | select(.name == $name) | select((.serverFarmId | ascii_downcase) != ($id | ascii_downcase))] | length == 0' <<<"$apps" >/dev/null; then
+            echo "::error::Existing app is not in the dedicated plan; refusing to move it."
+            exit 1
+          fi
+          if ! jq -e --arg id "$plan_id" --arg name "$AZURE_WEBAPP_NAME" '[.[] | select((.serverFarmId | ascii_downcase) == ($id | ascii_downcase) and .name != $name)] | length == 0' <<<"$apps" >/dev/null; then
+            echo "::error::The App Service plan must be dedicated to this app."
+            exit 1
+          fi
+          plans="$(az appservice plan list --resource-group "$AZURE_RESOURCE_GROUP" --output json)"
+          expected_sites="$(jq --arg name "$AZURE_WEBAPP_NAME" '[.[] | select(.name == $name)] | length' <<<"$apps")"
+          if ! jq -e --arg name "$AZURE_APP_SERVICE_PLAN_NAME" --argjson expected "$expected_sites" '[.[] | select(.name == $name) | select(.numberOfSites != $expected)] | length == 0' <<<"$plans" >/dev/null; then
+            echo "::error::The dedicated plan has unexpected sites."
+            exit 1
+          fi
+          if jq -e --arg name "$AZURE_WEBAPP_NAME" 'any(.[]; .name == $name)' <<<"$apps" >/dev/null; then
+            count="$(az webapp deployment slot list --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" --query 'length(@)' -o tsv)"
+            [[ "$count" == 0 ]] || { echo "::error::Deployment slots are not supported."; exit 1; }
+          fi
+          autoscale="$(az monitor autoscale list --resource-group "$AZURE_RESOURCE_GROUP" --output json)"
+          if ! jq -e --arg id "$plan_id" '[.[] | select(.enabled == true and (.targetResourceUri | ascii_downcase) == ($id | ascii_downcase))] | length == 0' <<<"$autoscale" >/dev/null; then
+            echo "::error::Autoscale must be disabled for the dedicated plan."
+            exit 1
+          fi
+      - name: Stop existing app before changing infrastructure
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(az webapp list --resource-group "$AZURE_RESOURCE_GROUP" --query "[?name=='$AZURE_WEBAPP_NAME'] | length(@)" -o tsv)" != 0 ]]; then
+            az webapp stop --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" --output none
+            [[ "$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query state -o tsv)" == "Stopped" ]]
+          fi
+      - name: Provision infrastructure
+        shell: bash
+        run: |
+          set -euo pipefail
+          az deployment group create --resource-group "$AZURE_RESOURCE_GROUP" --name control-plane-production \
+            --template-file infra/main.bicep \
+            --parameters \
+              webAppName="$AZURE_WEBAPP_NAME" appServicePlanName="$AZURE_APP_SERVICE_PLAN_NAME" identityName="$AZURE_IDENTITY_NAME" \
+              keyVaultName="$AZURE_KEY_VAULT_NAME" keyVaultResourceGroup="$AZURE_KEY_VAULT_RESOURCE_GROUP" \
+              entraSecretName="$ENTRA_SECRET_NAME" githubTokenSecretName="$GITHUB_TOKEN_SECRET_NAME" \
+              entraTenantId="$ENTRA_TENANT_ID" entraClientId="$ENTRA_CLIENT_ID" entraApiAudience="$ENTRA_API_AUDIENCE" \
+              entraReadOnlyGroupId="$ENTRA_READ_ONLY_GROUP_ID" entraOperatorGroupId="$ENTRA_OPERATOR_GROUP_ID" \
+              githubOrganization="$GITHUB_ORGANIZATION" githubRunnerGroupId="$GITHUB_RUNNER_GROUP_ID" \
+              runnerLabel="${RUNNER_LABEL:-linux-dotnet}" imageWorkloadClientId="$AZURE_CLIENT_ID" \
+              vmssEnabled="${AZURE_VMSS_ENABLED:-false}" vmssResourceGroup="$AZURE_VMSS_RESOURCE_GROUP" \
+              vmssName="$AZURE_VMSS_NAME" vmssCustomRoleDefinitionId="$AZURE_VMSS_ROLE_DEFINITION_ID" \
+            --output none
+          az webapp stop -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
+          [[ "$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query state -o tsv)" == "Stopped" ]]
+      - name: Verify Key Vault references
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_id="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query id -o tsv)"
+          for attempt in {1..30}; do
+            if entra_status="$(az rest --method get --url "https://management.azure.com${app_id}/config/configreferences/appsettings/Entra__ClientSecret?api-version=2022-03-01" --output json 2>/dev/null)" \
+              && github_status="$(az rest --method get --url "https://management.azure.com${app_id}/config/configreferences/appsettings/GitHub__Token?api-version=2022-03-01" --output json 2>/dev/null)" \
+              && jq -e '.properties.status == "Resolved"' <<<"$entra_status" >/dev/null \
+              && jq -e '.properties.status == "Resolved"' <<<"$github_status" >/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Key Vault references did not resolve. Check secret-scoped RBAC, network access and identity propagation."
+          exit 1
+      - name: Deploy tested artifact through maintenance mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          az webapp start -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
+          az webapp deploy -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --src-path release/control-plane.zip --type zip --restart false --track-status false --output none
+          az webapp stop -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
+          [[ "$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query state -o tsv)" == "Stopped" ]] || { echo "::error::Could not stop maintenance mode."; exit 1; }
+          app_id="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query id -o tsv)"
+          az rest --method patch --url "https://management.azure.com${app_id}/config/web?api-version=2023-12-01" \
+            --body '{"properties":{"appCommandLine":""}}' --output none
+          if ! az webapp config show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query appCommandLine -o json | jq -e '. == ""' >/dev/null; then
+            echo "::error::Maintenance startup command was not cleared; app remains stopped."
+            exit 1
+          fi
+          az webapp start -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
+      - name: Check HTTPS API response
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query defaultHostName -o tsv)"
+          url="$(az deployment group show -g "$AZURE_RESOURCE_GROUP" -n control-plane-production --query properties.outputs.appUrl.value -o tsv)"
+          [[ "$host" =~ ^[a-zA-Z0-9.-]+$ && "$url" == "https://$host" ]] || { echo "::error::Deployment returned an invalid app URL."; exit 1; }
+          for attempt in {1..30}; do
+            status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "$url/api/runner-images" || true)"
+            if [[ "$status" == 401 ]]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::The control-plane API did not become ready; inspect App Service diagnostics."
+          exit 1
