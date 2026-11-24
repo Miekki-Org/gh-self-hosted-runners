@@ -9,6 +9,36 @@
         "version": "8.5.0-2ubuntu10.7",
         "repository": "ubuntu-noble-main"
       }
+    ],
+    "git": [
+      {
+        "version": "1:2.34.1-1ubuntu1.10",
+        "repository": "ubuntu-noble-main"
+      }
+    ],
+    "jq": [
+      {
+        "version": "1.6-2ubuntu0.1",
+        "repository": "ubuntu-noble-main"
+      }
+    ],
+    "wget": [
+      {
+        "version": "1.21.2-1ubuntu1",
+        "repository": "ubuntu-noble-main"
+      }
+    ],
+    "tar": [
+      {
+        "version": "1.34-1ubuntu1",
+        "repository": "ubuntu-noble-main"
+      }
+    ],
+    "unzip": [
+      {
+        "version": "6.0-26ubuntu0.1",
+        "repository": "ubuntu-noble-main"
+      }
     ]
   }
 }

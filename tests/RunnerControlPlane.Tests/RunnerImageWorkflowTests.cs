@@ -118,27 +118,117 @@ public sealed class RunnerImageWorkflowTests
         Assert.Equal(2, Count(result.Error, "CURL_URL="));
     }
 
-    [Theory]
-    [InlineData("", true)]
-    [InlineData("sleep infinity", false)]
-    public async Task DeploymentClearsMaintenanceCommandBeforeStarting(string startup, bool shouldStart)
+    [Fact]
+    public void DeploymentWarmsStagingBeforeSwapAndNeverStopsProduction()
     {
         var workflow = File.ReadAllText(Path.Combine(Root, ".github/workflows/deploy-control-plane.yml"));
-        var step = workflow.Split("      - name: Deploy tested artifact through maintenance mode\n", StringSplitOptions.None)[1];
+        Assert.DoesNotContain("az webapp stop", workflow);
+        Assert.Contains("az webapp deploy -g \"$AZURE_RESOURCE_GROUP\" -n \"$AZURE_WEBAPP_NAME\" --slot staging", workflow);
+        Assert.Contains("/health/ready", workflow);
+        Assert.Contains("az webapp deployment slot swap", workflow);
+        Assert.Contains("restoring the previous production slot", workflow);
+        Assert.Contains("INITIAL_BOOTSTRAP_CONFIRMED=true", workflow);
+        Assert.Contains("The staging slot is not provisioned", workflow);
+        Assert.Contains("if: steps.validate.outputs.bootstrap == 'true'", workflow);
+        Assert.Contains("Bootstrap new production app", workflow);
+        Assert.Contains("Bootstrap dedicated worker", workflow);
+        Assert.Contains("BackgroundWorkers__WorkerOnly", workflow);
+        Assert.DoesNotContain("maintenance mode", workflow, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("", true)]
+    [InlineData("production", false)]
+    [InlineData("staging", false)]
+    [InlineData("worker", false)]
+    public async Task DeploymentRejectsUnsafeWorkerSettingsBeforeDeploying(string unsafeTarget, bool allowed)
+    {
+        var workflow = File.ReadAllText(Path.Combine(Root, ".github/workflows/deploy-control-plane.yml"));
+        var step = workflow.Split("      - name: Deploy and warm staging slot, then swap\n", StringSplitOptions.None)[1];
+        var script = step.Split("        run: |\n", StringSplitOptions.None)[1]
+            .Split("          az webapp deploy -g", StringSplitOptions.None)[0];
+        script = string.Join('\n', script.Split('\n').Select(line =>
+            line.StartsWith("          ", StringComparison.Ordinal) ? line[10..] : line));
+        const string mocks = """
+            az() {
+              if [[ "$1 $2 $3" == "webapp show -g" ]]; then
+                echo app.azurewebsites.net
+              elif [[ "$1 $2 $3" == "webapp config appsettings" ]]; then
+                target=production
+                [[ "$*" != *"--slot staging"* ]] || target=staging
+                [[ "$*" != *"-n worker"* ]] || target=worker
+                enabled=false
+                only=false
+                if [[ "$target" == worker ]]; then enabled=true; only=true; fi
+                if [[ "$target" == "$MOCK_UNSAFE_TARGET" ]]; then
+                  if [[ "$enabled" == true ]]; then enabled=false; else enabled=true; fi
+                fi
+                printf '[{"name":"BackgroundWorkers__Enabled","value":"%s"},{"name":"BackgroundWorkers__WorkerOnly","value":"%s"},{"name":"TableStorage__Enabled","value":"true"}]\n' "$enabled" "$only"
+              else
+                return 1
+              fi
+            }
+            curl() { printf 200; }
+            """;
+        var start = new ProcessStartInfo("bash")
+        {
+            WorkingDirectory = Root,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        start.ArgumentList.Add("-c");
+        start.ArgumentList.Add(mocks + "\n" + script + "\necho SAFE_TO_DEPLOY\n");
+        start.Environment["AZURE_RESOURCE_GROUP"] = "rg";
+        start.Environment["AZURE_WEBAPP_NAME"] = "app";
+        start.Environment["AZURE_WORKER_APP_NAME"] = "worker";
+        start.Environment["MOCK_UNSAFE_TARGET"] = unsafeTarget;
+        using var process = Process.Start(start)!;
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        var output = await stdout;
+        var error = await stderr;
+        Assert.True((process.ExitCode == 0) == allowed, output + error);
+        Assert.Equal(allowed, output.Contains("SAFE_TO_DEPLOY", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(true, "", "true", "false", false, "true")]
+    [InlineData(true, "", "true", "true", true, "true")]
+    [InlineData(true, "true", "false", "true", false, "false")]
+    [InlineData(true, "true", "true", "false", true, "true")]
+    [InlineData(true, "", "", "false", false, "false")]
+    [InlineData(true, "true", "", "false", true, "true")]
+    [InlineData(false, "", "", "false", true, "true")]
+    public async Task DeploymentProtectsStorageCutover(
+        bool appExists, string previousStorage, string enabled, string migrationConfirmed, bool allowed, string effectiveMode)
+    {
+        var workflow = File.ReadAllText(Path.Combine(Root, ".github/workflows/deploy-control-plane.yml"));
+        var step = workflow.Split("      - name: Validate inputs and existing topology\n", StringSplitOptions.None)[1];
         var script = step.Split("        run: |\n", StringSplitOptions.None)[1]
             .Split("      - name:", StringSplitOptions.None)[0];
         script = string.Join('\n', script.Split('\n').Select(line =>
             line.StartsWith("          ", StringComparison.Ordinal) ? line[10..] : line));
         const string mocks = """
             az() {
-              printf 'az %s\n' "$*" >&2
-              case "$1 $2" in
-                'webapp show')
-                  if [[ "$*" == *'--query state'* ]]; then echo Stopped; else echo /subscriptions/test/resourceGroups/rg/providers/Microsoft.Web/sites/app; fi ;;
-                'webapp config') printf '"%s"\n' "$MOCK_STARTUP" ;;
-                'rest --method')
-                  [[ "$3" == patch && "$*" == *'/config/web?api-version=2023-12-01'* ]] || return 1
-                  [[ "$*" == *'{"properties":{"appCommandLine":""}}'* ]] || return 1 ;;
+              case "$1 $2 $3" in
+                'webapp list --resource-group')
+                  if [[ "$MOCK_APP_EXISTS" == "true" ]]; then
+                    printf '[{"name":"app","serverFarmId":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Web/serverfarms/plan"},{"name":"worker","serverFarmId":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Web/serverfarms/plan"}]\n'
+                  else
+                    echo '[]'
+                  fi ;;
+                'webapp config appsettings') echo "$MOCK_PREVIOUS_STORAGE" ;;
+                'webapp deployment slot') echo '[{"name":"staging"}]' ;;
+                'webapp show --resource-group') echo Running ;;
+                'appservice plan list')
+                  if [[ "$MOCK_APP_EXISTS" == "true" ]]; then
+                    echo '[{"name":"plan","numberOfSites":3}]'
+                  else
+                    echo '[{"name":"plan","numberOfSites":0}]'
+                  fi ;;
+                'monitor autoscale list') echo '[]' ;;
+                *) return 1 ;;
               esac
             }
             """;
@@ -150,23 +240,38 @@ public sealed class RunnerImageWorkflowTests
         };
         start.ArgumentList.Add("-c");
         start.ArgumentList.Add(mocks + "\n" + script);
+        foreach (var name in new[]
+        {
+            "AZURE_RESOURCE_GROUP", "AZURE_WEBAPP_NAME", "AZURE_SUBSCRIPTION_ID", "AZURE_CLIENT_ID",
+            "AZURE_APP_SERVICE_PLAN_NAME", "AZURE_IDENTITY_NAME", "AZURE_KEY_VAULT_NAME",
+            "AZURE_KEY_VAULT_RESOURCE_GROUP", "ENTRA_SECRET_NAME", "GITHUB_TOKEN_SECRET_NAME", "DATA_PROTECTION_KEY_NAME",
+            "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "ENTRA_API_AUDIENCE", "ENTRA_READ_ONLY_GROUP_ID",
+            "ENTRA_OPERATOR_GROUP_ID", "GITHUB_ORGANIZATION", "GITHUB_RUNNER_GROUP_ID"
+        })
+            start.Environment[name] = "test";
         start.Environment["AZURE_RESOURCE_GROUP"] = "rg";
         start.Environment["AZURE_WEBAPP_NAME"] = "app";
-        start.Environment["MOCK_STARTUP"] = startup;
+        start.Environment["AZURE_WORKER_APP_NAME"] = "worker";
+        start.Environment["AZURE_SUBSCRIPTION_ID"] = "sub";
+        start.Environment["AZURE_APP_SERVICE_PLAN_NAME"] = "plan";
+        start.Environment["GITHUB_RUNNER_GROUP_ID"] = "1";
+        start.Environment["AZURE_VMSS_ENABLED"] = "false";
+        start.Environment["GITHUB_ENV"] = "/dev/stdout";
+        start.Environment["GITHUB_OUTPUT"] = "/dev/stdout";
+        start.Environment["MOCK_APP_EXISTS"] = appExists ? "true" : "false";
+        start.Environment["MOCK_PREVIOUS_STORAGE"] = previousStorage;
+        start.Environment["TABLE_STORAGE_ENABLED"] = enabled;
+        start.Environment["TABLE_STORAGE_MIGRATION_CONFIRMED"] = migrationConfirmed;
+        start.Environment["INITIAL_BOOTSTRAP_CONFIRMED"] = appExists ? "false" : "true";
         using var process = Process.Start(start)!;
         var stdout = process.StandardOutput.ReadToEndAsync();
         var stderr = process.StandardError.ReadToEndAsync();
         await process.WaitForExitAsync();
         var output = await stdout;
         var error = await stderr;
-        Assert.Equal(shouldStart, process.ExitCode == 0);
-        Assert.Contains("az rest --method patch", error);
-        Assert.Contains("{\"properties\":{\"appCommandLine\":\"\"}}", error);
-        Assert.Equal(shouldStart ? 2 : 1, Count(error, "az webapp start"));
-        if (shouldStart)
-            Assert.True(error.IndexOf("az webapp config show", StringComparison.Ordinal) < error.LastIndexOf("az webapp start", StringComparison.Ordinal));
-        else
-            Assert.Contains("Maintenance startup command was not cleared", output);
+        Assert.True((process.ExitCode == 0) == allowed, output + error);
+        if (allowed)
+            Assert.Contains($"TABLE_STORAGE_ENABLED={effectiveMode}", output);
     }
 
     private static JsonObject Resource() => new()

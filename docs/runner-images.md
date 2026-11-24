@@ -55,7 +55,7 @@ The deployment sets `RunnerImageBuild__WorkloadClientId` to the image workflow's
 Configure these GitHub `production` environment variables before enabling or dispatching the workflow:
 
 - `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` for the Azure application configured with GitHub Actions OIDC federation.
-- `AZURE_RESOURCE_GROUP` and `AZURE_WEBAPP_NAME` for the deployed App Service.
+- `AZURE_RESOURCE_GROUP` and, if not using the default `mm-ghshr-uks-prod-app`, `AZURE_WEBAPP_NAME` for the deployed App Service.
 - `RUNNER_IMAGE_API_SCOPE` for the control-plane API's v2 `/.default` scope.
 
 The job runs only on `main` and uses the protected `production` environment. It queries Azure for the exact named running App Service and validates its resource ID and default `azurewebsites.net` hostname before constructing the HTTPS URL. It does not consume `RUNNER_IMAGE_API_URL` and does not deploy or rebuild the control plane. Its app-only token must satisfy the workload policy above; it need not be an operator. The authenticated readiness GET may return `403` for this narrowly scoped workload, while the registration POST is the authorization check. The registration step exposes `build_id` and `manifest_digest` as step outputs and fails if the returned digest differs from the locally resolved request. See [deployment and identity setup](runner-deployment.md) for federation, permission scopes, and isolated verification.
@@ -66,4 +66,4 @@ This workflow resolves and registers an external build; it does not provision th
 
 The Azure image builder and GitHub-backed validator are replaceable `IRunnerImageBuilder` and `IRunnerImageValidator` integrations. The default registrations deliberately fail builds as unconfigured; they do not simulate successful Azure or GitHub operations. A deployment must replace both registrations with implementations that build the Azure image and run all required validation steps.
 
-Image records are persisted to `RunnerImageBuild__StateFilePath` (default: `data/runner-image-state.json`) using atomic file replacement. The deployment configures persistent `/home`; verify restart/redeployment persistence and atomic replacement in the target Azure environment rather than assuming it. Rollout and Runner VM state are in memory, and automatic production promotion is not ready; see [deployment limitations](runner-deployment.md).
+Image, rollout, and Runner VM records use provisioned Azure tables when `TableStorage__Enabled` is true; otherwise image records use `RunnerImageBuild__StateFilePath` (default: `data/runner-image-state.json`) and VM and rollout state is in memory. Claimed builds require manual reconciliation after interruption; automatic production promotion is not ready. See [deployment and migration limitations](runner-deployment.md).

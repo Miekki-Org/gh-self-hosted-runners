@@ -19,7 +19,11 @@ public sealed class RunnerCapacityReconcileWorker(
             {
                 await controller.ReconcileAsync(stoppingToken);
             }
-            catch (RunnerCapacityIntegrationException exception)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception exception)
             {
                 logger.LogError(exception, "Runner capacity reconciliation failed.");
             }

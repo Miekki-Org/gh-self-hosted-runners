@@ -2,9 +2,12 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Text.Json;
+using Azure;
+using Azure.Data.Tables;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -23,6 +26,20 @@ namespace RunnerControlPlane.Tests;
 [Collection("Runner access startup")]
 public sealed class RunnerAccessEndpointTests
 {
+    [Fact]
+    public async Task WorkerHostDoesNotExposeApplicationEndpoints()
+    {
+        using var factory = new RunnerControlPlaneFactory(configurationOverrides: new Dictionary<string, string?>
+        {
+            ["BackgroundWorkers:WorkerOnly"] = "true"
+        });
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync("/api/runner-vms")).StatusCode);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, (await client.GetAsync("/health/ready")).StatusCode);
+    }
+
     [Fact]
     public async Task UnauthenticatedUserCannotReadRunnerAccess()
     {
@@ -296,19 +313,149 @@ public sealed class RunnerAccessEndpointTests
         Assert.Contains("Entra:ReadOnlyGroupId and Entra:OperatorGroupId must be different", exception.ToString());
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("http://storage.example")]
+    [InlineData("https://storage.example/path")]
+    [InlineData("https://storage.example/?token=secret")]
+    public void InvalidTableStorageEndpointIsRejectedAtStartup(string endpoint)
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["TableStorage:Enabled"] = "true",
+                ["TableStorage:Endpoint"] = endpoint,
+                ["DataProtection:BlobUri"] = "https://storage.example/dataprotection/keys.xml",
+                ["DataProtection:KeyUri"] = "https://vault.example/keys/example"
+            });
+
+        var exception = Record.Exception(() => factory.CreateClient());
+
+        Assert.NotNull(exception);
+        Assert.Contains("TableStorage:Endpoint must be an HTTPS table service origin", exception.ToString());
+    }
+
+    [Theory]
+    [InlineData("DataProtection:BlobUri", "")]
+    [InlineData("DataProtection:BlobUri", "http://storage.example/keys.xml")]
+    [InlineData("DataProtection:KeyUri", "https://vault.example/keys/key?secret=value")]
+    public void InvalidSharedDataProtectionConfigurationIsRejected(string name, string value)
+    {
+        var settings = new Dictionary<string, string?>
+        {
+            ["TableStorage:Enabled"] = "true",
+            ["TableStorage:Endpoint"] = "https://storage.example/",
+            ["DataProtection:BlobUri"] = "https://storage.example/dataprotection/keys.xml",
+            ["DataProtection:KeyUri"] = "https://vault.example/keys/example"
+        };
+        settings[name] = value;
+        using var factory = new RunnerControlPlaneFactory(configurationOverrides: settings);
+
+        var exception = Record.Exception(() => factory.CreateClient());
+
+        Assert.NotNull(exception);
+        Assert.Contains("DataProtection:BlobUri and DataProtection:KeyUri must be HTTPS resource URIs", exception.ToString());
+    }
+
+    [Fact]
+    public async Task ReadinessRejectsFileBasedState()
+    {
+        using var factory = new RunnerControlPlaneFactory();
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/health/ready");
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(null, null, HttpStatusCode.OK)]
+    [InlineData("RunnerVms", null, HttpStatusCode.ServiceUnavailable)]
+    [InlineData("RunnerRollouts", null, HttpStatusCode.ServiceUnavailable)]
+    [InlineData(null, "RunnerCapacity", HttpStatusCode.ServiceUnavailable)]
+    [InlineData(null, "RunnerVms", HttpStatusCode.ServiceUnavailable)]
+    [InlineData(null, "RunnerRollouts", HttpStatusCode.ServiceUnavailable)]
+    public async Task ReadinessChecksSharedStores(string? failingTable, string? blockedTable, HttpStatusCode expected)
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["TableStorage:Enabled"] = "true",
+                ["TableStorage:Endpoint"] = "https://storage.example/",
+                ["DataProtection:BlobUri"] = "https://storage.example/dataprotection/keys.xml",
+                ["DataProtection:KeyUri"] = "https://vault.example/keys/example"
+            },
+            fakeReadiness: true,
+            failingTable: failingTable,
+            blockedTable: blockedTable);
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/health/ready");
+
+        Assert.Equal(expected, response.StatusCode);
+    }
+
     [CollectionDefinition("Runner access startup", DisableParallelization = true)]
     public sealed class RunnerAccessStartupCollection;
+
+    private sealed class ReadinessTableServiceClient(string? failingTable, string? blockedTable) : TableServiceClient
+    {
+        public override TableClient GetTableClient(string tableName)
+        {
+            if (tableName != blockedTable)
+            {
+                return new ReadinessTableClient(tableName == failingTable);
+            }
+
+            var table = new RunnerVmEndpointTests.TestTableClient();
+            var partition = tableName switch
+            {
+                "RunnerCapacity" => "runner-capacity",
+                "RunnerVms" => "runner-vm-import",
+                _ => "runner-rollout-import"
+            };
+            table.AddEntity(new TableEntity(partition, tableName == "RunnerCapacity" ? "settings" : "guard")
+            {
+                ["Owner"] = "migration"
+            });
+            return table;
+        }
+    }
+
+    private sealed class ReadinessTableClient(bool fail) : TableClient
+    {
+        public override Pageable<T> Query<T>(
+            string? filter = null, int? maxPerPage = null, IEnumerable<string>? select = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (fail)
+            {
+                throw new RequestFailedException(503, "Table unavailable.");
+            }
+
+            return Pageable<T>.FromPages([]);
+        }
+    }
 
     private sealed class RunnerControlPlaneFactory : WebApplicationFactory<Program>
     {
         private readonly IReadOnlyDictionary<string, string?> _configurationOverrides;
+        private readonly bool _fakeReadiness;
+        private readonly string? _failingTable;
+        private readonly string? _blockedTable;
 
         public RunnerControlPlaneFactory(
             bool groupAllowsAllRepositories = false,
-            IReadOnlyDictionary<string, string?>? configurationOverrides = null)
+            IReadOnlyDictionary<string, string?>? configurationOverrides = null,
+            bool fakeReadiness = false,
+            string? failingTable = null,
+            string? blockedTable = null)
         {
             GitHubApi = new FakeGitHubApiHandler(groupAllowsAllRepositories);
             _configurationOverrides = configurationOverrides ?? new Dictionary<string, string?>();
+            _fakeReadiness = fakeReadiness;
+            _failingTable = failingTable;
+            _blockedTable = blockedTable;
         }
 
         public FakeGitHubApiHandler GitHubApi { get; }
@@ -340,6 +487,13 @@ public sealed class RunnerAccessEndpointTests
 
             builder.ConfigureTestServices(services =>
             {
+                if (_fakeReadiness)
+                {
+                    services.RemoveAll<TableServiceClient>();
+                    services.AddSingleton<TableServiceClient>(new ReadinessTableServiceClient(_failingTable, _blockedTable));
+                    services.RemoveAll<IDataProtectionProvider>();
+                    services.AddSingleton<IDataProtectionProvider>(new EphemeralDataProtectionProvider());
+                }
                 services.PostConfigure<OpenIdConnectOptions>("entra", options =>
                     options.ConfigurationManager = new Microsoft.IdentityModel.Protocols.StaticConfigurationManager<Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration>(
                         new Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration

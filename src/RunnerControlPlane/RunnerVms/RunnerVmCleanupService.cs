@@ -12,44 +12,54 @@ public interface IRunnerVmCleanupService
 
 public sealed class RunnerVmCleanupService(
     IRunnerVmStore runnerVms,
-    IOptions<RunnerCapacityOptions> options) : IRunnerVmCleanupService
+    IOptions<RunnerCapacityOptions> options,
+    IRunnerVmOperationLock operationLock) : IRunnerVmCleanupService
 {
-    public Task<int> RetireIdleVmsAsync(CancellationToken cancellationToken = default)
+    public async Task<int> RetireIdleVmsAsync(CancellationToken cancellationToken = default)
     {
-        if (cancellationToken.IsCancellationRequested)
+        var lease = await operationLock.AcquireAsync(cancellationToken);
+        var mutationStarted = false;
+        try
         {
-            return Task.FromCanceled<int>(cancellationToken);
-        }
 
-        var now = DateTimeOffset.UtcNow;
-        var minimumCapacity = options.Value.MinimumCapacity;
-        var gracePeriod = TimeSpan.FromSeconds(Math.Max(0, options.Value.IdleGracePeriodSeconds));
-        var idleVms = runnerVms.List()
-            .Where(IsEligibleForAutomaticCleanup)
-            .Where(vm => vm.UpdatedAt is not null && vm.UpdatedAt.Value.Add(gracePeriod) <= now)
-            .OrderBy(vm => vm.UpdatedAt ?? DateTimeOffset.MinValue)
-            .ToArray();
+            var now = DateTimeOffset.UtcNow;
+            var minimumCapacity = options.Value.MinimumCapacity;
+            var gracePeriod = TimeSpan.FromSeconds(Math.Max(0, options.Value.IdleGracePeriodSeconds));
+            var idleVms = runnerVms.List()
+                .Where(IsEligibleForAutomaticCleanup)
+                .Where(vm => vm.UpdatedAt is not null && vm.UpdatedAt.Value.Add(gracePeriod) <= now)
+                .OrderBy(vm => vm.UpdatedAt ?? DateTimeOffset.MinValue)
+                .ToArray();
 
-        if (idleVms.Length == 0)
-        {
-            return Task.FromResult(0);
-        }
-
-        var retired = 0;
-        var eligibleIdleCount = runnerVms.List().Count(IsEligibleForAutomaticCleanup);
-        foreach (var vm in idleVms)
-        {
-            if (eligibleIdleCount <= minimumCapacity)
+            if (idleVms.Length == 0)
             {
-                break;
+                lease.Complete();
+                return 0;
             }
 
-            runnerVms.Retire(vm.Id, "Success", "system", null, "automatic-idle-retire");
-            eligibleIdleCount--;
-            retired++;
-        }
+            var retired = 0;
+            var eligibleIdleCount = runnerVms.List().Count(IsEligibleForAutomaticCleanup);
+            foreach (var vm in idleVms)
+            {
+                if (eligibleIdleCount <= minimumCapacity)
+                {
+                    break;
+                }
 
-        return Task.FromResult(retired);
+                mutationStarted = true;
+                runnerVms.Retire(vm.Id, "Success", "system", null, "automatic-idle-retire");
+                eligibleIdleCount--;
+                retired++;
+            }
+
+            lease.Complete();
+            return retired;
+        }
+        catch
+        {
+            if (!mutationStarted) lease.Complete();
+            throw;
+        }
     }
 
     private static bool IsEligibleForAutomaticCleanup(RunnerVmRecord vm)

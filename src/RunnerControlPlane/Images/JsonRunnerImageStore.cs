@@ -94,67 +94,80 @@ public class JsonRunnerImageStore : IRunnerImageStore
                 return new(RunnerImageBuildResultStatus.NotFound, null, "The runner image build was not found.");
             }
 
-            if (current.ManifestDigest is null)
+            var submission = EvaluateBuildResult(current, result, actor);
+            if (submission.Status == RunnerImageBuildResultStatus.Recorded)
             {
-                return new(RunnerImageBuildResultStatus.Invalid, current, "This runner image was not registered for an external build.");
+                _images[version] = submission.Image!;
+                Persist();
             }
 
-            if (!current.ManifestDigest.Equals(result.ManifestDigest, StringComparison.OrdinalIgnoreCase))
-            {
-                return new(RunnerImageBuildResultStatus.ManifestMismatch, current, "The result manifest digest does not match the registered build.");
-            }
-
-            var inventoryFailure = RunnerImageInventoryValidator.Validate(current.BuildRequest, result.Inventory);
-            if (inventoryFailure is not null)
-            {
-                return new(RunnerImageBuildResultStatus.InventoryMismatch, current, inventoryFailure);
-            }
-
-            var frozenResult = Freeze(result);
-            if (current.BuildResult is not null)
-            {
-                var status = AreEquivalent(current.BuildResult, frozenResult)
-                    ? RunnerImageBuildResultStatus.Idempotent
-                    : RunnerImageBuildResultStatus.ConflictingRetry;
-                return new(
-                    status,
-                    current,
-                    status == RunnerImageBuildResultStatus.ConflictingRetry
-                        ? "A conflicting result was already recorded for this build."
-                        : null);
-            }
-
-            var succeeded = result.Succeeded && result.Validation.IsSuccessful;
-            if (succeeded && string.IsNullOrWhiteSpace(result.AzureImageId))
-            {
-                return new(RunnerImageBuildResultStatus.Invalid, current, "A successful result must include an Azure image identifier.");
-            }
-
-            var failureReason = succeeded
-                ? null
-                : FirstNonEmpty(result.FailureReason, result.Validation.FailureReason)
-                    ?? "The image failed one or more required validation checks.";
-            var updated = current with
-            {
-                Status = succeeded ? RunnerImageBuildStatus.Complete : RunnerImageBuildStatus.Failed,
-                Inventory = frozenResult.Inventory,
-                AzureImageId = string.IsNullOrWhiteSpace(frozenResult.AzureImageId)
-                    ? null
-                    : frozenResult.AzureImageId,
-                FailureReason = failureReason,
-                BuildResult = frozenResult,
-                AuditTrail = (current.AuditTrail ?? [])
-                    .Append(new RunnerImageBuildAuditRecord(
-                        actor,
-                        DateTimeOffset.UtcNow,
-                        "report-result",
-                        succeeded ? "succeeded" : "failed"))
-                    .ToArray()
-            };
-            _images[version] = updated;
-            Persist();
-            return new(RunnerImageBuildResultStatus.Recorded, updated, null);
+            return submission;
         }
+    }
+
+    internal static RunnerImageBuildResultSubmission EvaluateBuildResult(
+        RunnerImage current,
+        RunnerImageBuildResult result,
+        string actor)
+    {
+        if (current.ManifestDigest is null)
+        {
+            return new(RunnerImageBuildResultStatus.Invalid, current, "This runner image was not registered for an external build.");
+        }
+
+        if (!current.ManifestDigest.Equals(result.ManifestDigest, StringComparison.OrdinalIgnoreCase))
+        {
+            return new(RunnerImageBuildResultStatus.ManifestMismatch, current, "The result manifest digest does not match the registered build.");
+        }
+
+        var inventoryFailure = RunnerImageInventoryValidator.Validate(current.BuildRequest, result.Inventory);
+        if (inventoryFailure is not null)
+        {
+            return new(RunnerImageBuildResultStatus.InventoryMismatch, current, inventoryFailure);
+        }
+
+        var frozenResult = Freeze(result);
+        if (current.BuildResult is not null)
+        {
+            var status = AreEquivalent(current.BuildResult, frozenResult)
+                ? RunnerImageBuildResultStatus.Idempotent
+                : RunnerImageBuildResultStatus.ConflictingRetry;
+            return new(
+                status,
+                current,
+                status == RunnerImageBuildResultStatus.ConflictingRetry
+                    ? "A conflicting result was already recorded for this build."
+                    : null);
+        }
+
+        var succeeded = result.Succeeded && result.Validation.IsSuccessful;
+        if (succeeded && string.IsNullOrWhiteSpace(result.AzureImageId))
+        {
+            return new(RunnerImageBuildResultStatus.Invalid, current, "A successful result must include an Azure image identifier.");
+        }
+
+        var failureReason = succeeded
+            ? null
+            : FirstNonEmpty(result.FailureReason, result.Validation.FailureReason)
+                ?? "The image failed one or more required validation checks.";
+        var updated = current with
+        {
+            Status = succeeded ? RunnerImageBuildStatus.Complete : RunnerImageBuildStatus.Failed,
+            Inventory = frozenResult.Inventory,
+            AzureImageId = string.IsNullOrWhiteSpace(frozenResult.AzureImageId)
+                ? null
+                : frozenResult.AzureImageId,
+            FailureReason = failureReason,
+            BuildResult = frozenResult,
+            AuditTrail = (current.AuditTrail ?? [])
+                .Append(new RunnerImageBuildAuditRecord(
+                    actor,
+                    DateTimeOffset.UtcNow,
+                    "report-result",
+                    succeeded ? "succeeded" : "failed"))
+                .ToArray()
+        };
+        return new(RunnerImageBuildResultStatus.Recorded, updated, null);
     }
 
     public RunnerImage AddQueued(string version, RunnerImageBuildRequest request)
@@ -234,7 +247,7 @@ public class JsonRunnerImageStore : IRunnerImageStore
         return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
     }
 
-    private void Load(string json)
+    internal static IReadOnlyList<RunnerImage> ReadState(string json)
     {
         try
         {
@@ -246,14 +259,19 @@ public class JsonRunnerImageStore : IRunnerImageStore
                 throw new InvalidDataException("The saved runner image state is invalid.");
             }
 
-            foreach (var image in state.Images)
-            {
-                _images.TryAdd(image.Version, image);
-            }
+            return state.Images;
         }
         catch (JsonException exception)
         {
             throw new InvalidDataException("The saved runner image state is invalid JSON.", exception);
+        }
+    }
+
+    private void Load(string json)
+    {
+        foreach (var image in ReadState(json))
+        {
+            _images.TryAdd(image.Version, image);
         }
     }
 

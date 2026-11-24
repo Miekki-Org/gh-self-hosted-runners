@@ -47,15 +47,18 @@ jobs:
       id-token: write
     env:
       AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-      AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+      AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME || 'mm-ghshr-uks-prod-app' }}
+      AZURE_WORKER_APP_NAME: ${{ vars.AZURE_WORKER_APP_NAME || 'mm-ghshr-uks-prod-worker' }}
       AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-      AZURE_APP_SERVICE_PLAN_NAME: ${{ vars.AZURE_APP_SERVICE_PLAN_NAME }}
-      AZURE_IDENTITY_NAME: ${{ vars.AZURE_IDENTITY_NAME }}
-      AZURE_KEY_VAULT_NAME: ${{ vars.AZURE_KEY_VAULT_NAME }}
-      AZURE_KEY_VAULT_RESOURCE_GROUP: ${{ vars.AZURE_KEY_VAULT_RESOURCE_GROUP }}
+      AZURE_APP_SERVICE_PLAN_NAME: ${{ vars.AZURE_APP_SERVICE_PLAN_NAME || 'mm-ghshr-uks-prod-asp' }}
+      AZURE_IDENTITY_NAME: ${{ vars.AZURE_IDENTITY_NAME || 'mm-ghshr-uks-prod-id' }}
+      AZURE_KEY_VAULT_NAME: ${{ vars.AZURE_KEY_VAULT_NAME || 'mm-ghshr-uks-prod-kv' }}
+      AZURE_KEY_VAULT_RESOURCE_GROUP: ${{ vars.AZURE_KEY_VAULT_RESOURCE_GROUP || vars.AZURE_RESOURCE_GROUP }}
       ENTRA_SECRET_NAME: ${{ vars.ENTRA_SECRET_NAME }}
       GITHUB_TOKEN_SECRET_NAME: ${{ vars.GITHUB_TOKEN_SECRET_NAME }}
+      DATA_PROTECTION_KEY_NAME: ${{ vars.DATA_PROTECTION_KEY_NAME }}
+      INITIAL_BOOTSTRAP_CONFIRMED: ${{ vars.INITIAL_BOOTSTRAP_CONFIRMED }}
       ENTRA_TENANT_ID: ${{ vars.ENTRA_TENANT_ID }}
       ENTRA_CLIENT_ID: ${{ vars.ENTRA_CLIENT_ID }}
       ENTRA_API_AUDIENCE: ${{ vars.ENTRA_API_AUDIENCE }}
@@ -68,6 +71,8 @@ jobs:
       AZURE_VMSS_RESOURCE_GROUP: ${{ vars.AZURE_VMSS_RESOURCE_GROUP }}
       AZURE_VMSS_NAME: ${{ vars.AZURE_VMSS_NAME }}
       AZURE_VMSS_ROLE_DEFINITION_ID: ${{ vars.AZURE_VMSS_ROLE_DEFINITION_ID }}
+      TABLE_STORAGE_ENABLED: ${{ vars.TABLE_STORAGE_ENABLED }}
+      TABLE_STORAGE_MIGRATION_CONFIRMED: ${{ vars.TABLE_STORAGE_MIGRATION_CONFIRMED }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/download-artifact@v8.0.2
@@ -81,10 +86,11 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Validate inputs and existing topology
+        id: validate
         shell: bash
         run: |
           set -euo pipefail
-          for name in AZURE_RESOURCE_GROUP AZURE_WEBAPP_NAME AZURE_SUBSCRIPTION_ID AZURE_CLIENT_ID AZURE_APP_SERVICE_PLAN_NAME AZURE_IDENTITY_NAME AZURE_KEY_VAULT_NAME AZURE_KEY_VAULT_RESOURCE_GROUP ENTRA_SECRET_NAME GITHUB_TOKEN_SECRET_NAME ENTRA_TENANT_ID ENTRA_CLIENT_ID ENTRA_API_AUDIENCE ENTRA_READ_ONLY_GROUP_ID ENTRA_OPERATOR_GROUP_ID GITHUB_ORGANIZATION GITHUB_RUNNER_GROUP_ID; do
+          for name in AZURE_RESOURCE_GROUP AZURE_WEBAPP_NAME AZURE_WORKER_APP_NAME AZURE_SUBSCRIPTION_ID AZURE_CLIENT_ID AZURE_APP_SERVICE_PLAN_NAME AZURE_IDENTITY_NAME AZURE_KEY_VAULT_NAME AZURE_KEY_VAULT_RESOURCE_GROUP ENTRA_SECRET_NAME GITHUB_TOKEN_SECRET_NAME DATA_PROTECTION_KEY_NAME ENTRA_TENANT_ID ENTRA_CLIENT_ID ENTRA_API_AUDIENCE ENTRA_READ_ONLY_GROUP_ID ENTRA_OPERATOR_GROUP_ID GITHUB_ORGANIZATION GITHUB_RUNNER_GROUP_ID; do
             if [[ -z "$(printenv "$name")" ]]; then
               echo "::error::Missing production environment variable $name."
               exit 1
@@ -92,107 +98,275 @@ jobs:
           done
           [[ "$GITHUB_RUNNER_GROUP_ID" =~ ^[1-9][0-9]*$ ]] || { echo "::error::GITHUB_RUNNER_GROUP_ID must be positive."; exit 1; }
           [[ "$AZURE_WEBAPP_NAME" =~ ^[A-Za-z0-9-]{2,60}$ ]] || { echo "::error::AZURE_WEBAPP_NAME is invalid."; exit 1; }
+          [[ "$AZURE_WORKER_APP_NAME" =~ ^[A-Za-z0-9-]{2,60}$ && "$AZURE_WORKER_APP_NAME" != "$AZURE_WEBAPP_NAME" ]] || { echo "::error::AZURE_WORKER_APP_NAME is invalid."; exit 1; }
           [[ "${AZURE_VMSS_ENABLED:-false}" == "false" || "$AZURE_VMSS_ENABLED" == "true" ]] || { echo "::error::AZURE_VMSS_ENABLED must be true or false."; exit 1; }
+          [[ "${TABLE_STORAGE_ENABLED:-false}" == "false" || "$TABLE_STORAGE_ENABLED" == "true" ]] || { echo "::error::TABLE_STORAGE_ENABLED must be true or false."; exit 1; }
+          [[ "${INITIAL_BOOTSTRAP_CONFIRMED:-false}" == "false" || "${INITIAL_BOOTSTRAP_CONFIRMED:-}" == "true" ]] || { echo "::error::INITIAL_BOOTSTRAP_CONFIRMED must be true or false."; exit 1; }
           if [[ "${AZURE_VMSS_ENABLED:-false}" == "true" ]]; then
             [[ -n "$AZURE_VMSS_RESOURCE_GROUP" && -n "$AZURE_VMSS_NAME" && -n "$AZURE_VMSS_ROLE_DEFINITION_ID" ]] || { echo "::error::VMSS resource group, name and custom role ID are required."; exit 1; }
           fi
           apps="$(az webapp list --resource-group "$AZURE_RESOURCE_GROUP" --output json)"
+          app_exists=false
+          worker_exists=false
+          if jq -e --arg name "$AZURE_WORKER_APP_NAME" 'any(.[]; .name == $name)' <<<"$apps" >/dev/null; then
+            worker_exists=true
+          fi
+          previous_storage=""
+          if jq -e --arg name "$AZURE_WEBAPP_NAME" 'any(.[]; .name == $name)' <<<"$apps" >/dev/null; then
+            app_exists=true
+            previous_storage="$(az webapp config appsettings list --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" --query "[?name=='TableStorage__Enabled'].value | [0]" -o tsv | tr '[:upper:]' '[:lower:]')"
+            default_storage=false
+            [[ "$previous_storage" != "true" ]] || default_storage=true
+          else
+            default_storage=true
+          fi
+          TABLE_STORAGE_ENABLED="${TABLE_STORAGE_ENABLED:-$default_storage}"
+          [[ "$TABLE_STORAGE_ENABLED" == "true" ]] || { echo "::error::Slot deployment requires table-backed state."; exit 1; }
+          if [[ "$app_exists" == "false" ]]; then
+            [[ "$INITIAL_BOOTSTRAP_CONFIRMED" == "true" ]] || { echo "::error::The app does not exist. Set INITIAL_BOOTSTRAP_CONFIRMED=true to explicitly authorize the first production bootstrap; no old version can be kept available during this deployment."; exit 1; }
+            [[ "$worker_exists" == "false" ]] || { echo "::error::Worker already exists; reconcile it before bootstrap."; exit 1; }
+          else
+            [[ "$INITIAL_BOOTSTRAP_CONFIRMED" != "true" ]] || { echo "::error::INITIAL_BOOTSTRAP_CONFIRMED is only valid when creating the app for the first time."; exit 1; }
+            [[ "$worker_exists" == "true" ]] || { echo "::error::The dedicated worker is missing. Complete the approved maintenance migration before deploying."; exit 1; }
+          fi
+          echo "CONTROL_PLANE_BOOTSTRAP=$([[ "$app_exists" == "false" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+          echo "bootstrap=$([[ "$app_exists" == "false" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "TABLE_STORAGE_ENABLED=$TABLE_STORAGE_ENABLED" >> "$GITHUB_ENV"
           plan_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP/providers/Microsoft.Web/serverfarms/$AZURE_APP_SERVICE_PLAN_NAME"
-          if ! jq -e --arg id "$plan_id" --arg name "$AZURE_WEBAPP_NAME" '[.[] | select(.name == $name) | select((.serverFarmId | ascii_downcase) != ($id | ascii_downcase))] | length == 0' <<<"$apps" >/dev/null; then
-            echo "::error::Existing app is not in the dedicated plan; refusing to move it."
+          if ! jq -e --arg id "$plan_id" --arg name "$AZURE_WEBAPP_NAME" --arg worker "$AZURE_WORKER_APP_NAME" '[.[] | select(.name == $name or .name == $worker) | select((.serverFarmId | ascii_downcase) != ($id | ascii_downcase))] | length == 0' <<<"$apps" >/dev/null; then
+            echo "::error::Existing app or worker is not in the dedicated plan; refusing to move it."
             exit 1
           fi
-          if ! jq -e --arg id "$plan_id" --arg name "$AZURE_WEBAPP_NAME" '[.[] | select((.serverFarmId | ascii_downcase) == ($id | ascii_downcase) and .name != $name)] | length == 0' <<<"$apps" >/dev/null; then
-            echo "::error::The App Service plan must be dedicated to this app."
+          if ! jq -e --arg id "$plan_id" --arg name "$AZURE_WEBAPP_NAME" --arg worker "$AZURE_WORKER_APP_NAME" '[.[] | select((.serverFarmId | ascii_downcase) == ($id | ascii_downcase) and .name != $name and .name != $worker)] | length == 0' <<<"$apps" >/dev/null; then
+            echo "::error::The App Service plan must be dedicated to this app and worker."
             exit 1
+          fi
+          slots='[]'
+          if [[ "$app_exists" == "true" ]]; then
+            slots="$(az webapp deployment slot list --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" --output json)"
+            if ! jq -e 'all(.[]; .name == "staging" or (.name | endswith("/staging")))' <<<"$slots" >/dev/null; then
+              echo "::error::Only the managed staging slot is supported; remove or reconcile other slots before deployment."
+              exit 1
+            fi
+            slot_count="$(jq 'length' <<<"$slots")"
+            [[ "$slot_count" -le 1 ]] || { echo "::error::More than one deployment slot exists; refusing ambiguous topology."; exit 1; }
+            [[ "$slot_count" == 1 ]] || { echo "::error::The staging slot is not provisioned. Apply the infrastructure change as a separately approved maintenance migration; package releases will not update production configuration."; exit 1; }
+            app_state="$(az webapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" --query state -o tsv)"
+            [[ "$app_state" == "Running" ]] || { echo "::error::Production is not running; refusing to alter infrastructure or deploy without a healthy rollback target."; exit 1; }
+          else
+            slot_count=0
           fi
           plans="$(az appservice plan list --resource-group "$AZURE_RESOURCE_GROUP" --output json)"
-          expected_sites="$(jq --arg name "$AZURE_WEBAPP_NAME" '[.[] | select(.name == $name)] | length' <<<"$apps")"
+          if [[ "$app_exists" == "true" ]] && ! jq -e --arg name "$AZURE_APP_SERVICE_PLAN_NAME" 'any(.[]; .name == $name)' <<<"$plans" >/dev/null; then
+            echo "::error::The configured App Service plan does not exist in the resource group."
+            exit 1
+          fi
+          expected_sites="$(jq --arg name "$AZURE_WEBAPP_NAME" --arg worker "$AZURE_WORKER_APP_NAME" --argjson slots "$slot_count" '[.[] | select(.name == $name or .name == $worker)] | length + $slots' <<<"$apps")"
           if ! jq -e --arg name "$AZURE_APP_SERVICE_PLAN_NAME" --argjson expected "$expected_sites" '[.[] | select(.name == $name) | select(.numberOfSites != $expected)] | length == 0' <<<"$plans" >/dev/null; then
             echo "::error::The dedicated plan has unexpected sites."
             exit 1
           fi
           if jq -e --arg name "$AZURE_WEBAPP_NAME" 'any(.[]; .name == $name)' <<<"$apps" >/dev/null; then
-            count="$(az webapp deployment slot list --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" --query 'length(@)' -o tsv)"
-            [[ "$count" == 0 ]] || { echo "::error::Deployment slots are not supported."; exit 1; }
+            if [[ "$previous_storage" == "true" && "${TABLE_STORAGE_ENABLED:-false}" != "true" ]]; then
+              echo "::error::Refusing to switch back to file state; export and reconcile table data before changing the app setting explicitly."
+              exit 1
+            fi
+            if [[ "$previous_storage" != "true" && "${TABLE_STORAGE_ENABLED:-false}" == "true" && "${TABLE_STORAGE_MIGRATION_CONFIRMED:-false}" != "true" ]]; then
+              echo "::error::Migrate and verify existing state, then set TABLE_STORAGE_MIGRATION_CONFIRMED=true before enabling table storage."
+              exit 1
+            fi
           fi
           autoscale="$(az monitor autoscale list --resource-group "$AZURE_RESOURCE_GROUP" --output json)"
           if ! jq -e --arg id "$plan_id" '[.[] | select(.enabled == true and (.targetResourceUri | ascii_downcase) == ($id | ascii_downcase))] | length == 0' <<<"$autoscale" >/dev/null; then
             echo "::error::Autoscale must be disabled for the dedicated plan."
             exit 1
           fi
-      - name: Stop existing app before changing infrastructure
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$(az webapp list --resource-group "$AZURE_RESOURCE_GROUP" --query "[?name=='$AZURE_WEBAPP_NAME'] | length(@)" -o tsv)" != 0 ]]; then
-            az webapp stop --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" --output none
-            [[ "$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query state -o tsv)" == "Stopped" ]]
-          fi
       - name: Provision infrastructure
+        if: steps.validate.outputs.bootstrap == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          az deployment group create --resource-group "$AZURE_RESOURCE_GROUP" --name control-plane-production \
+          location="$(az group show --name "$AZURE_RESOURCE_GROUP" --query location -o tsv)"
+          [[ -n "$location" ]] || { echo "::error::Could not determine resource group location."; exit 1; }
+          az stack group create --resource-group "$AZURE_RESOURCE_GROUP" --name control-plane-production \
+            --action-on-unmanage detachAll --deny-settings-mode none --yes \
             --template-file infra/main.bicep \
             --parameters \
-              webAppName="$AZURE_WEBAPP_NAME" appServicePlanName="$AZURE_APP_SERVICE_PLAN_NAME" identityName="$AZURE_IDENTITY_NAME" \
+              location="$location" webAppName="$AZURE_WEBAPP_NAME" workerAppName="$AZURE_WORKER_APP_NAME" appServicePlanName="$AZURE_APP_SERVICE_PLAN_NAME" identityName="$AZURE_IDENTITY_NAME" \
               keyVaultName="$AZURE_KEY_VAULT_NAME" keyVaultResourceGroup="$AZURE_KEY_VAULT_RESOURCE_GROUP" \
-              entraSecretName="$ENTRA_SECRET_NAME" githubTokenSecretName="$GITHUB_TOKEN_SECRET_NAME" \
+              entraSecretName="$ENTRA_SECRET_NAME" githubTokenSecretName="$GITHUB_TOKEN_SECRET_NAME" dataProtectionKeyName="$DATA_PROTECTION_KEY_NAME" \
               entraTenantId="$ENTRA_TENANT_ID" entraClientId="$ENTRA_CLIENT_ID" entraApiAudience="$ENTRA_API_AUDIENCE" \
               entraReadOnlyGroupId="$ENTRA_READ_ONLY_GROUP_ID" entraOperatorGroupId="$ENTRA_OPERATOR_GROUP_ID" \
               githubOrganization="$GITHUB_ORGANIZATION" githubRunnerGroupId="$GITHUB_RUNNER_GROUP_ID" \
               runnerLabel="${RUNNER_LABEL:-linux-dotnet}" imageWorkloadClientId="$AZURE_CLIENT_ID" \
+              tableStorageEnabled="${TABLE_STORAGE_ENABLED:-false}" \
               vmssEnabled="${AZURE_VMSS_ENABLED:-false}" vmssResourceGroup="$AZURE_VMSS_RESOURCE_GROUP" \
               vmssName="$AZURE_VMSS_NAME" vmssCustomRoleDefinitionId="$AZURE_VMSS_ROLE_DEFINITION_ID" \
             --output none
-          az webapp stop -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
-          [[ "$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query state -o tsv)" == "Stopped" ]]
       - name: Verify Key Vault references
         shell: bash
         run: |
           set -euo pipefail
           app_id="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query id -o tsv)"
+          slot_id="${app_id}/slots/staging"
+          references_resolved=false
           for attempt in {1..30}; do
             if entra_status="$(az rest --method get --url "https://management.azure.com${app_id}/config/configreferences/appsettings/Entra__ClientSecret?api-version=2022-03-01" --output json 2>/dev/null)" \
               && github_status="$(az rest --method get --url "https://management.azure.com${app_id}/config/configreferences/appsettings/GitHub__Token?api-version=2022-03-01" --output json 2>/dev/null)" \
               && jq -e '.properties.status == "Resolved"' <<<"$entra_status" >/dev/null \
               && jq -e '.properties.status == "Resolved"' <<<"$github_status" >/dev/null; then
-              exit 0
+              references_resolved=true
+              break
             fi
             sleep 10
           done
-          echo "::error::Key Vault references did not resolve. Check secret-scoped RBAC, network access and identity propagation."
-          exit 1
-      - name: Deploy tested artifact through maintenance mode
-        shell: bash
-        run: |
-          set -euo pipefail
-          az webapp start -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
-          az webapp deploy -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --src-path release/control-plane.zip --type zip --restart false --track-status false --output none
-          az webapp stop -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
-          [[ "$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query state -o tsv)" == "Stopped" ]] || { echo "::error::Could not stop maintenance mode."; exit 1; }
-          app_id="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query id -o tsv)"
-          az rest --method patch --url "https://management.azure.com${app_id}/config/web?api-version=2023-12-01" \
-            --body '{"properties":{"appCommandLine":""}}' --output none
-          if ! az webapp config show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query appCommandLine -o json | jq -e '. == ""' >/dev/null; then
-            echo "::error::Maintenance startup command was not cleared; app remains stopped."
+          if [[ "$references_resolved" != true ]]; then
+            echo "::error::Production Key Vault references did not resolve. Check secret-scoped RBAC, network access and identity propagation."
             exit 1
           fi
-          az webapp start -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
-      - name: Check HTTPS API response
+          if [[ "${CONTROL_PLANE_BOOTSTRAP:-false}" != "true" ]]; then
+            slot_references_resolved=false
+            for attempt in {1..30}; do
+              if entra_slot_status="$(az rest --method get --url "https://management.azure.com${slot_id}/config/configreferences/appsettings/Entra__ClientSecret?api-version=2022-03-01" --output json 2>/dev/null)" \
+                && github_slot_status="$(az rest --method get --url "https://management.azure.com${slot_id}/config/configreferences/appsettings/GitHub__Token?api-version=2022-03-01" --output json 2>/dev/null)" \
+                && jq -e '.properties.status == "Resolved"' <<<"$entra_slot_status" >/dev/null \
+                && jq -e '.properties.status == "Resolved"' <<<"$github_slot_status" >/dev/null; then
+                slot_references_resolved=true
+                break
+              fi
+              sleep 10
+            done
+            if [[ "$slot_references_resolved" != true ]]; then
+              echo "::error::Staging Key Vault references did not resolve; refusing to deploy or swap."
+              exit 1
+            fi
+          fi
+      - name: Deploy and warm staging slot, then swap
+        if: steps.validate.outputs.bootstrap != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          host="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query defaultHostName -o tsv)"
-          url="$(az deployment group show -g "$AZURE_RESOURCE_GROUP" -n control-plane-production --query properties.outputs.appUrl.value -o tsv)"
-          [[ "$host" =~ ^[a-zA-Z0-9.-]+$ && "$url" == "https://$host" ]] || { echo "::error::Deployment returned an invalid app URL."; exit 1; }
+          production_host="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query defaultHostName -o tsv)"
+          [[ "$production_host" =~ ^[A-Za-z0-9.-]+$ && "$production_host" == *.azurewebsites.net ]] || { echo "::error::Production returned an invalid hostname."; exit 1; }
+          production_ready=false
           for attempt in {1..30}; do
-            status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "$url/api/runner-images" || true)"
-            if [[ "$status" == 401 ]]; then
+            status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "https://${production_host}/health/ready" || true)"
+            if [[ "$status" == 200 ]]; then
+              production_ready=true
+              break
+            fi
+            sleep 10
+          done
+          [[ "$production_ready" == true ]] || { echo "::error::Current production did not pass /health/ready; refusing to deploy without a healthy rollback target."; exit 1; }
+          for target in production staging worker; do
+            name="$AZURE_WEBAPP_NAME"
+            [[ "$target" != worker ]] || name="$AZURE_WORKER_APP_NAME"
+            if [[ "$target" == staging ]]; then
+              settings="$(az webapp config appsettings list -g "$AZURE_RESOURCE_GROUP" -n "$name" --slot staging --output json)"
+            else
+              settings="$(az webapp config appsettings list -g "$AZURE_RESOURCE_GROUP" -n "$name" --output json)"
+            fi
+            if [[ "$target" == worker ]]; then
+              enabled=true
+              worker_only=true
+            else
+              enabled=false
+              worker_only=false
+            fi
+            if ! jq -e --arg enabled "$enabled" --arg only "$worker_only" '
+              (any(.[]; .name == "BackgroundWorkers__Enabled" and (.value | ascii_downcase) == $enabled)) and
+              (any(.[]; .name == "BackgroundWorkers__WorkerOnly" and (.value | ascii_downcase) == $only)) and
+              (any(.[]; .name == "TableStorage__Enabled" and (.value | ascii_downcase) == "true"))
+            ' <<<"$settings" >/dev/null; then
+              echo "::error::$target has unsafe worker or storage settings; perform the maintenance migration first."
+              exit 1
+            fi
+          done
+          worker_host="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WORKER_APP_NAME" --query defaultHostName -o tsv)"
+          [[ "$worker_host" =~ ^[A-Za-z0-9.-]+$ && "$worker_host" == *.azurewebsites.net ]] || { echo "::error::Worker returned an invalid hostname."; exit 1; }
+          worker_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "https://${worker_host}/health/ready" || true)"
+          [[ "$worker_status" == 200 ]] || { echo "::error::Dedicated worker is not ready; refusing to swap."; exit 1; }
+          az webapp deploy -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --slot staging --src-path release/control-plane.zip --type zip --restart true --track-status true --output none
+          az webapp start -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --slot staging --output none
+          host="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --slot staging --query defaultHostName -o tsv)"
+          [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$host" == *.azurewebsites.net ]] || { echo "::error::Staging slot returned an invalid hostname."; exit 1; }
+          url="https://$host/health/ready"
+          ready=false
+          for attempt in {1..30}; do
+            status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "$url" || true)"
+            if [[ "$status" == 200 ]]; then
+              ready=true
+              break
+            fi
+            sleep 10
+          done
+          [[ "$ready" == true ]] || { echo "::error::Staging did not pass /health/ready; production was not swapped."; exit 1; }
+          swapped=false
+          rollback() {
+            status=$?
+            if [[ "$status" != 0 && "$swapped" == true ]]; then
+              trap - EXIT
+              echo "::error::Production readiness failed after swap; restoring the previous production slot."
+              if az webapp deployment slot swap -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --slot staging --target-slot production --output none; then
+                rollback_host="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query defaultHostName -o tsv)"
+                rollback_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "https://${rollback_host}/health/ready" || true)"
+                [[ "$rollback_status" == 200 ]] || echo "::error::Rollback completed but previous production did not pass readiness."
+              else
+                echo "::error::Automatic rollback failed; inspect App Service slot state immediately."
+              fi
+            fi
+            exit "$status"
+          }
+          trap rollback EXIT
+          az webapp deployment slot swap -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --slot staging --target-slot production --output none
+          swapped=true
+          host="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query defaultHostName -o tsv)"
+          [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$host" == *.azurewebsites.net ]] || { echo "::error::Production returned an invalid hostname after swap."; exit 1; }
+          ready=false
+          for attempt in {1..30}; do
+            status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "https://${host}/health/ready" || true)"
+            if [[ "$status" == 200 ]]; then
+              ready=true
+              break
+            fi
+            sleep 10
+          done
+          [[ "$ready" == true ]] || { echo "::error::Production did not pass /health/ready after swap."; exit 1; }
+          swapped=false
+          trap - EXIT
+      - name: Bootstrap new production app
+        if: steps.validate.outputs.bootstrap == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          az webapp deploy -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --src-path release/control-plane.zip --type zip --restart true --track-status true --output none
+          az webapp start -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --output none
+          host="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WEBAPP_NAME" --query defaultHostName -o tsv)"
+          [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$host" == *.azurewebsites.net ]] || { echo "::error::Bootstrap returned an invalid hostname."; exit 1; }
+          for attempt in {1..30}; do
+            status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "https://${host}/health/ready" || true)"
+            if [[ "$status" == 200 ]]; then
               exit 0
             fi
             sleep 10
           done
-          echo "::error::The control-plane API did not become ready; inspect App Service diagnostics."
+          echo "::error::Initial bootstrap did not pass /health/ready. There is no prior production version to roll back to."
+          exit 1
+      - name: Bootstrap dedicated worker
+        if: steps.validate.outputs.bootstrap == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          az webapp deploy -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WORKER_APP_NAME" --src-path release/control-plane.zip --type zip --restart true --track-status true --output none
+          az webapp start -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WORKER_APP_NAME" --output none
+          host="$(az webapp show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_WORKER_APP_NAME" --query defaultHostName -o tsv)"
+          [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$host" == *.azurewebsites.net ]] || { echo "::error::Worker returned an invalid hostname."; exit 1; }
+          for attempt in {1..30}; do
+            status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "https://${host}/health/ready" || true)"
+            if [[ "$status" == 200 ]]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Dedicated worker did not pass /health/ready; reconcile bootstrap before releasing."
           exit 1

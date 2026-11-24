@@ -22,7 +22,7 @@ Live VM Scale Set operations are disabled by default. Configure the following se
 
 The control plane uses `DefaultAzureCredential`; assign its managed identity (or local developer identity) permission to read and update the VM Scale Set and delete specific instances. The VM Scale Set must be preconfigured to bootstrap GitHub Actions runners with the configured label. Runner names must match VM host names so the control plane can select only idle instances for scale-in. If it cannot match a busy runner to an instance, scale-in fails closed.
 
-When `RunnerCapacity:StateFilePath` is set, updated capacity settings and their audit records are saved as JSON at that path. The default is `data/runner-capacity-state.json`; use durable storage for this path in production. Leave it empty to keep capacity settings and audit records in process memory. The file store uses process-local locking, so run one control-plane replica when using it.
+When `TableStorage:Enabled` is true, capacity settings and audit records use the provisioned Azure table via managed identity. An interrupted or uncertain capacity operation leaves its table lock in place so another process cannot repeat a potentially completed VMSS operation. Stop writers and reconcile Azure capacity, settings and audit before an authorized operator clears that lock; never clear an incomplete migration without reconciling its partial data. When table storage is disabled and `RunnerCapacity:StateFilePath` is set, state is saved as JSON at that path; leave it empty for process memory. The file store uses process-local locking. See [deployment](runner-deployment.md) for migration and slot deployment restrictions.
 
 ## GitHub permissions
 

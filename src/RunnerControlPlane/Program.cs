@@ -13,6 +13,51 @@ using RunnerControlPlane.RunnerCapacity;
 using RunnerControlPlane.RunnerVms;
 using Microsoft.Extensions.Options;
 using System.Text.Json.Serialization;
+using Azure.Data.Tables;
+using Azure.Identity;
+using Microsoft.AspNetCore.DataProtection;
+
+if (args.Length > 0 && args[0] == "--import-table-state")
+{
+    if (args.Length is not (4 or 5)
+        || !Uri.TryCreate(args[1], UriKind.Absolute, out var importEndpoint)
+        || importEndpoint.Scheme != Uri.UriSchemeHttps
+        || !string.IsNullOrEmpty(importEndpoint.UserInfo)
+        || !string.IsNullOrEmpty(importEndpoint.Query)
+        || !string.IsNullOrEmpty(importEndpoint.Fragment)
+        || importEndpoint.AbsolutePath != "/"
+        || (args.Length == 4 && args[2] is not ("capacity" or "images"))
+        || (args.Length == 5 && args[2] is not ("vms" or "rollouts")))
+    {
+        throw new ArgumentException(
+            "Usage: --import-table-state <https-table-service-origin> <capacity|images> <json-file>, "
+            + "or --import-table-state <https-table-service-origin> <vms|rollouts> <records-json> <audit-json>.");
+    }
+
+    var tables = new TableServiceClient(importEndpoint, new DefaultAzureCredential());
+    if (args[2] == "capacity")
+    {
+        await new AzureTableRunnerCapacityStateStore(tables.GetTableClient("RunnerCapacity"))
+            .ImportJsonAsync(args[3]);
+    }
+    else if (args[2] == "images")
+    {
+        new AzureTableRunnerImageStore(tables.GetTableClient("RunnerImages")).ImportJsonFile(args[3]);
+    }
+    else if (args[2] == "vms")
+    {
+        new AzureTableRunnerVmStore(tables.GetTableClient("RunnerVms"))
+            .ImportJson(await File.ReadAllTextAsync(args[3]), await File.ReadAllTextAsync(args[4]));
+    }
+    else
+    {
+        new AzureTableRunnerImageRolloutStore(tables.GetTableClient("RunnerRollouts"))
+            .ImportJson(await File.ReadAllTextAsync(args[3]), await File.ReadAllTextAsync(args[4]));
+    }
+
+    Console.WriteLine($"Imported {args[2]} state into Table Storage.");
+    return;
+}
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -91,6 +136,24 @@ builder.Services
     .AddOptions<RunnerImageBuildOptions>()
     .BindConfiguration("RunnerImageBuild");
 
+builder.Services
+    .AddOptions<TableStorageOptions>()
+    .BindConfiguration("TableStorage")
+    .Validate(
+        options => !options.Enabled
+            || (Uri.TryCreate(options.Endpoint, UriKind.Absolute, out var endpoint)
+                && endpoint.Scheme == Uri.UriSchemeHttps
+                && string.IsNullOrEmpty(endpoint.UserInfo)
+                && string.IsNullOrEmpty(endpoint.Query)
+                && string.IsNullOrEmpty(endpoint.Fragment)
+                && endpoint.AbsolutePath == "/"),
+        "TableStorage:Endpoint must be an HTTPS table service origin when enabled.")
+    .Validate(
+        options => !options.Enabled || IsValidSharedDataProtection(
+            builder.Configuration["DataProtection:BlobUri"], builder.Configuration["DataProtection:KeyUri"]),
+        "DataProtection:BlobUri and DataProtection:KeyUri must be HTTPS resource URIs.")
+    .ValidateOnStart();
+
 builder.Services.AddHttpClient<IGitHubRunnerGroupClient, GitHubRunnerGroupClient>((services, client) =>
 {
     var options = services.GetRequiredService<Microsoft.Extensions.Options.IOptions<GitHubOptions>>().Value;
@@ -113,13 +176,59 @@ builder.Services.AddHttpClient<IGitHubRunnerCapacityClient, GitHubRunnerCapacity
 
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
-builder.Services.AddSingleton<IRunnerImageStore, JsonRunnerImageStore>();
-builder.Services.AddSingleton<IRunnerImageRolloutStore, InMemoryRunnerImageRolloutStore>();
+if (builder.Configuration.GetValue<bool>("TableStorage:Enabled"))
+{
+    var blobValue = builder.Configuration["DataProtection:BlobUri"];
+    var keyValue = builder.Configuration["DataProtection:KeyUri"];
+    if (!IsValidSharedDataProtection(blobValue, keyValue))
+    {
+        throw new InvalidOperationException("DataProtection:BlobUri and DataProtection:KeyUri must be HTTPS resource URIs.");
+    }
+
+    var credential = new DefaultAzureCredential();
+    builder.Services.AddDataProtection()
+        .SetApplicationName("RunnerControlPlane")
+        .PersistKeysToAzureBlobStorage(new Uri(blobValue!), credential)
+        .ProtectKeysWithAzureKeyVault(new Uri(keyValue!), credential);
+    builder.Services.AddSingleton(services =>
+    {
+        var options = services.GetRequiredService<IOptions<TableStorageOptions>>().Value;
+        return new TableServiceClient(new Uri(options.Endpoint), credential);
+    });
+    builder.Services.AddSingleton<IRunnerImageStore>(services =>
+        new AzureTableRunnerImageStore(
+            services.GetRequiredService<TableServiceClient>().GetTableClient("RunnerImages")));
+    builder.Services.AddSingleton<IRunnerCapacityStateStore>(services =>
+        new AzureTableRunnerCapacityStateStore(
+            services.GetRequiredService<TableServiceClient>().GetTableClient("RunnerCapacity")));
+    builder.Services.AddSingleton<IRunnerVmStore>(services =>
+        new AzureTableRunnerVmStore(
+            services.GetRequiredService<TableServiceClient>().GetTableClient("RunnerVms")));
+    builder.Services.AddSingleton<IRunnerVmOperationLock>(services =>
+        new AzureTableRunnerVmOperationLock(
+            services.GetRequiredService<TableServiceClient>().GetTableClient("RunnerVms")));
+    builder.Services.AddSingleton<IRunnerImageRolloutStore>(services =>
+        new AzureTableRunnerImageRolloutStore(
+            services.GetRequiredService<TableServiceClient>().GetTableClient("RunnerRollouts")));
+    builder.Services.AddSingleton(services => new RunnerImageBuildQueue(
+        services.GetRequiredService<IRunnerImageStore>(),
+        services.GetRequiredService<IRunnerImageBuilder>(),
+        services.GetRequiredService<IRunnerImageValidator>(),
+        services.GetRequiredService<ILogger<RunnerImageBuildQueue>>(),
+        services.GetRequiredService<TableServiceClient>().GetTableClient("RunnerBuildQueue")));
+}
+else
+{
+    builder.Services.AddSingleton<IRunnerImageStore, JsonRunnerImageStore>();
+    builder.Services.AddSingleton<IRunnerCapacityStateStore, JsonRunnerCapacityStateStore>();
+    builder.Services.AddSingleton<IRunnerVmStore, InMemoryRunnerVmStore>();
+    builder.Services.AddSingleton<IRunnerVmOperationLock, InMemoryRunnerVmOperationLock>();
+    builder.Services.AddSingleton<IRunnerImageRolloutStore, InMemoryRunnerImageRolloutStore>();
+    builder.Services.AddSingleton<RunnerImageBuildQueue>();
+}
 builder.Services.AddSingleton<IRunnerImageRolloutService, RunnerImageRolloutService>();
-builder.Services.AddSingleton<IRunnerVmStore, InMemoryRunnerVmStore>();
 builder.Services.AddSingleton<IRunnerVmRecoveryService, RunnerVmRecoveryService>();
 builder.Services.AddSingleton<IRunnerVmCleanupService, RunnerVmCleanupService>();
-builder.Services.AddHostedService<RunnerVmCleanupWorker>();
 if (builder.Configuration.GetValue<bool>("AzureVmScaleSet:Enabled"))
 {
     builder.Services.AddSingleton<IAzureVmScaleSetClient, AzureVmScaleSetClient>();
@@ -128,16 +237,18 @@ else
 {
     builder.Services.AddSingleton<IAzureVmScaleSetClient, InMemoryAzureVmScaleSetClient>();
 }
-builder.Services.AddSingleton<IRunnerCapacityStateStore, JsonRunnerCapacityStateStore>();
 builder.Services.AddSingleton<IRunnerCapacityController, RunnerCapacityController>();
-builder.Services.AddHostedService<RunnerCapacityReconcileWorker>();
 builder.Services.AddSingleton<IRunnerImageBuilder, UnconfiguredRunnerImageBuilder>();
 builder.Services.AddSingleton<IRunnerImageValidator, UnconfiguredRunnerImageValidator>();
-builder.Services.AddSingleton<RunnerImageBuildQueue>();
 builder.Services.AddSingleton<IRunnerImageBuildQueue>(services =>
     services.GetRequiredService<RunnerImageBuildQueue>());
-builder.Services.AddHostedService(services => services.GetRequiredService<RunnerImageBuildQueue>());
-builder.Services.AddHostedService<RunnerImageScheduleWorker>();
+builder.Services.AddSingleton<RunnerVmCleanupWorker>();
+builder.Services.AddSingleton<RunnerCapacityReconcileWorker>();
+builder.Services.AddSingleton<RunnerImageScheduleWorker>();
+builder.Services.AddHostedService<ConditionalHostedService<RunnerVmCleanupWorker>>();
+builder.Services.AddHostedService<ConditionalHostedService<RunnerCapacityReconcileWorker>>();
+builder.Services.AddHostedService<ConditionalHostedService<RunnerImageBuildQueue>>();
+builder.Services.AddHostedService<ConditionalHostedService<RunnerImageScheduleWorker>>();
 
 const string requestAuthenticationScheme = "request";
 const string entraAuthenticationScheme = "entra";
@@ -316,8 +427,71 @@ builder.Services.AddAuthorization(options =>
 
 var app = builder.Build();
 
+app.Use(async (context, next) =>
+{
+    if (context.RequestServices.GetRequiredService<IConfiguration>()
+            .GetValue<bool>("BackgroundWorkers:WorkerOnly")
+        && context.Request.Path != "/health/ready")
+    {
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return;
+    }
+    await next();
+});
+
 app.UseAuthentication();
 app.UseAuthorization();
+
+app.MapGet("/health/ready", (
+        IServiceProvider services,
+        IConfiguration configuration,
+        ILoggerFactory loggerFactory) =>
+    {
+        if (!configuration.GetValue<bool>("TableStorage:Enabled"))
+        {
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
+
+        try
+        {
+            var tables = services.GetRequiredService<TableServiceClient>();
+            foreach (var name in new[] { "RunnerCapacity", "RunnerImages", "RunnerVms", "RunnerRollouts", "RunnerBuildQueue" })
+            {
+                _ = tables.GetTableClient(name)
+                    .Query<TableEntity>(filter: "PartitionKey eq '__readiness__'", maxPerPage: 1)
+                    .Take(1).ToArray();
+            }
+
+            if (tables.GetTableClient("RunnerCapacity").Query<TableEntity>(
+                    filter: "PartitionKey eq 'runner-capacity' and RowKey eq 'settings' and Owner eq 'migration'",
+                    maxPerPage: 1).Any()
+                || tables.GetTableClient("RunnerVms").Query<TableEntity>(
+                    filter: "PartitionKey eq 'runner-vm-import' and RowKey eq 'guard'",
+                    maxPerPage: 1).Any()
+                || tables.GetTableClient("RunnerRollouts").Query<TableEntity>(
+                    filter: "PartitionKey eq 'runner-rollout-import' and RowKey eq 'guard'",
+                    maxPerPage: 1).Any())
+            {
+                throw new InvalidOperationException("A state migration requires reconciliation.");
+            }
+
+            var protector = services.GetRequiredService<IDataProtectionProvider>()
+                .CreateProtector("RunnerControlPlane.Readiness");
+            var value = Guid.NewGuid().ToString("N");
+            if (protector.Unprotect(protector.Protect(value)) != value)
+            {
+                throw new InvalidOperationException("The data protection readiness check failed.");
+            }
+
+            return Results.Ok();
+        }
+        catch (Exception exception)
+        {
+            loggerFactory.CreateLogger("Readiness").LogError(exception, "Control plane readiness check failed.");
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
+    })
+    .AllowAnonymous();
 
 app.MapGet("/", () => Results.Content(RunnerAccessPage.Html, "text/html; charset=utf-8"))
     .RequireAuthorization(AccessPolicies.CanView);
@@ -707,30 +881,10 @@ app.MapPost("/api/runner-vms/{id}/health-checks", async (
     })
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPost("/api/runner-vm", (CreateRunnerVmRequest? request, IRunnerVmStore runnerVms, IRunnerImageStore images, IOptions<RunnerOptions> runnerOptions) =>
-    {
-        var selectedImage = GetRequestedImageVersion(request, images);
-        if (selectedImage is null)
-        {
-            return Results.BadRequest(new { error = "No validated runner image is available." });
-        }
-
-        var vm = runnerVms.Create(selectedImage, runnerOptions.Value.Label, "Shared Linux");
-        return Results.Accepted($"/api/runner-vms/{vm.Id}", vm);
-    })
+app.MapPost("/api/runner-vm", CreateRunnerVmAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPost("/api/runner-vms", (CreateRunnerVmRequest? request, IRunnerVmStore runnerVms, IRunnerImageStore images, IOptions<RunnerOptions> runnerOptions) =>
-    {
-        var selectedImage = GetRequestedImageVersion(request, images);
-        if (selectedImage is null)
-        {
-            return Results.BadRequest(new { error = "No validated runner image is available." });
-        }
-
-        var vm = runnerVms.Create(selectedImage, runnerOptions.Value.Label, "Shared Linux");
-        return Results.Accepted($"/api/runner-vms/{vm.Id}", vm);
-    })
+app.MapPost("/api/runner-vms", CreateRunnerVmAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
 
 app.MapPatch("/api/runner-vm/{id}", UpdateRunnerVmAsync)
@@ -743,40 +897,10 @@ app.MapPatch("/api/runner-vm/{id}/status", UpdateRunnerVmStatusAsync)
 app.MapPatch("/api/runner-vms/{id}/status", UpdateRunnerVmStatusAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPost("/api/runner-vm/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null, string? actor = null, ClaimsPrincipal user = null!) =>
-    {
-        var vm = runnerVms.Get(id);
-        if (vm is null)
-        {
-            return Results.NotFound();
-        }
-
-        if (vm.Status != RunnerVmStatus.Idle)
-        {
-            return Results.Conflict(new { error = "Only idle Runner VMs can be retired manually." });
-        }
-
-        var completed = runnerVms.Retire(id, outcome ?? "Success", string.IsNullOrWhiteSpace(actor) ? GetActor(user) : actor, error, "manual-retire");
-        return Results.Ok(completed);
-    })
+app.MapPost("/api/runner-vm/{id}/retire", RetireRunnerVmAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
 
-app.MapPost("/api/runner-vms/{id}/retire", (string id, IRunnerVmStore runnerVms, string? outcome = "Success", string? error = null, string? actor = null, ClaimsPrincipal user = null!) =>
-    {
-        var vm = runnerVms.Get(id);
-        if (vm is null)
-        {
-            return Results.NotFound();
-        }
-
-        if (vm.Status != RunnerVmStatus.Idle)
-        {
-            return Results.Conflict(new { error = "Only idle Runner VMs can be retired manually." });
-        }
-
-        var completed = runnerVms.Retire(id, outcome ?? "Success", string.IsNullOrWhiteSpace(actor) ? GetActor(user) : actor, error, "manual-retire");
-        return Results.Ok(completed);
-    })
+app.MapPost("/api/runner-vms/{id}/retire", RetireRunnerVmAsync)
     .RequireAuthorization(AccessPolicies.CanManage);
 
 app.MapPost("/api/runner-vms/{id}/force-remove", async (
@@ -798,6 +922,56 @@ app.MapPost("/api/runner-vms/{id}/force-remove", async (
     .RequireAuthorization(AccessPolicies.CanManage);
 
 app.Run();
+
+static async Task<IResult> CreateRunnerVmAsync(
+    CreateRunnerVmRequest? request,
+    IRunnerVmStore runnerVms,
+    IRunnerImageStore images,
+    IOptions<RunnerOptions> runnerOptions,
+    IRunnerVmOperationLock operationLock,
+    CancellationToken cancellationToken)
+{
+    var selectedImage = GetRequestedImageVersion(request, images);
+    if (selectedImage is null)
+    {
+        return Results.BadRequest(new { error = "No validated runner image is available." });
+    }
+
+    var lease = await operationLock.AcquireAsync(cancellationToken);
+    var vm = runnerVms.Create(selectedImage, runnerOptions.Value.Label, "Shared Linux");
+    lease.Complete();
+    return Results.Accepted($"/api/runner-vms/{vm.Id}", vm);
+}
+
+static async Task<IResult> RetireRunnerVmAsync(
+    string id,
+    IRunnerVmStore runnerVms,
+    IRunnerVmOperationLock operationLock,
+    ClaimsPrincipal user,
+    CancellationToken cancellationToken,
+    string? outcome = "Success",
+    string? error = null,
+    string? actor = null)
+{
+    var lease = await operationLock.AcquireAsync(cancellationToken);
+    var vm = runnerVms.Get(id);
+    if (vm is null)
+    {
+        lease.Complete();
+        return Results.NotFound();
+    }
+
+    if (vm.Status != RunnerVmStatus.Idle)
+    {
+        lease.Complete();
+        return Results.Conflict(new { error = "Only idle Runner VMs can be retired manually." });
+    }
+
+    var completed = runnerVms.Retire(id, outcome ?? "Success",
+        string.IsNullOrWhiteSpace(actor) ? GetActor(user) : actor, error, "manual-retire");
+    lease.Complete();
+    return Results.Ok(completed);
+}
 
 static async Task<IResult> UpdateRunnerVmAsync(
     string id,
@@ -883,6 +1057,23 @@ static bool IsHttpsOrigin(string value)
 
     var pathStart = value.IndexOf('/', "https://".Length);
     return pathStart < 0 || pathStart == value.Length - 1;
+}
+
+static bool IsValidSharedDataProtection(string? blobValue, string? keyValue)
+{
+    return Uri.TryCreate(blobValue, UriKind.Absolute, out var blob)
+        && blob.Scheme == Uri.UriSchemeHttps
+        && string.IsNullOrEmpty(blob.UserInfo)
+        && string.IsNullOrEmpty(blob.Query)
+        && string.IsNullOrEmpty(blob.Fragment)
+        && blob.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries).Length >= 2
+        && Uri.TryCreate(keyValue, UriKind.Absolute, out var key)
+        && key.Scheme == Uri.UriSchemeHttps
+        && string.IsNullOrEmpty(key.UserInfo)
+        && string.IsNullOrEmpty(key.Query)
+        && string.IsNullOrEmpty(key.Fragment)
+        && key.AbsolutePath.StartsWith("/keys/", StringComparison.Ordinal)
+        && key.AbsolutePath.Length > "/keys/".Length;
 }
 
 static bool HasRunnerImageBuildWorkload(ClaimsPrincipal user, string clientId)

@@ -50,12 +50,30 @@ public sealed class RunnerImageScheduleWorker(
                 var weekStart = today.AddDays(-((7 + (int)now.DayOfWeek - (int)buildDay) % 7));
                 if (lastScheduledWeek != weekStart)
                 {
-                    queue.Queue(routineBuildRequest);
-                    lastScheduledWeek = weekStart;
-                    logger.LogInformation("Queued the routine weekly runner image build for {Week}.", weekStart);
+                    try
+                    {
+                        var queued = queue is RunnerImageBuildQueue durableQueue
+                            ? durableQueue.QueueRoutine(routineBuildRequest, weekStart)
+                            : QueueRoutine();
+                        lastScheduledWeek = weekStart;
+                        if (queued)
+                        {
+                            logger.LogInformation("Queued the routine weekly runner image build for {Week}.", weekStart);
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        logger.LogError(exception, "Could not queue the routine runner image build for {Week}; retrying.", weekStart);
+                    }
                 }
             }
         }
         while (await timer.WaitForNextTickAsync(stoppingToken));
+
+        bool QueueRoutine()
+        {
+            queue.Queue(routineBuildRequest);
+            return true;
+        }
     }
 }
