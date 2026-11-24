@@ -7,7 +7,12 @@
     "10.0"
   ],
   "packages": {
-    "curl": "ubuntu-noble-main"
+    "curl": "ubuntu-noble-main",
+    "jq": "ubuntu-noble-main",
+    "git": "ubuntu-noble-main",
+    "wget": "ubuntu-noble-main",
+    "tar": "ubuntu-noble-main",
+    "unzip": "ubuntu-noble-main"
   },
   "repositories": [
     {
@@ -22,7 +27,9 @@
         "{ubuntuCodename}-updates",
         "{ubuntuCodename}-security"
       ],
-      "components": ["main"]
+      "components": [
+        "main"
+      ]
     }
   ],
   "runner": {

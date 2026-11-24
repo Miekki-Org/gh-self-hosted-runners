@@ -2,11 +2,16 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Text.Json;
+using Azure;
+using Azure.Data.Tables;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authentication.OpenIdConnect;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -18,8 +23,23 @@ using RunnerControlPlane.RunnerCapacity;
 
 namespace RunnerControlPlane.Tests;
 
+[Collection("Runner access startup")]
 public sealed class RunnerAccessEndpointTests
 {
+    [Fact]
+    public async Task WorkerHostDoesNotExposeApplicationEndpoints()
+    {
+        using var factory = new RunnerControlPlaneFactory(configurationOverrides: new Dictionary<string, string?>
+        {
+            ["BackgroundWorkers:WorkerOnly"] = "true"
+        });
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync("/api/runner-vms")).StatusCode);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, (await client.GetAsync("/health/ready")).StatusCode);
+    }
+
     [Fact]
     public async Task UnauthenticatedUserCannotReadRunnerAccess()
     {
@@ -63,6 +83,94 @@ public sealed class RunnerAccessEndpointTests
             .Get(JwtBearerDefaults.AuthenticationScheme);
 
         Assert.Equal("api://client-id", options.Audience);
+    }
+
+    [Fact]
+    public async Task LoginUsesConfiguredPublicHttpsOriginInsteadOfRequestHost()
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["Entra:PublicBaseUrl"] = "https://runners.example.com:8443"
+            });
+        using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+            BaseAddress = new Uri("http://internal.test")
+        });
+        client.DefaultRequestHeaders.Host = "hostile.example";
+        client.DefaultRequestHeaders.Add("X-Forwarded-Host", "forwarded-hostile.example");
+        client.DefaultRequestHeaders.Add("X-Forwarded-Proto", "https");
+
+        var response = await client.GetAsync("/login");
+
+        Assert.True(response.StatusCode == HttpStatusCode.Redirect, await response.Content.ReadAsStringAsync());
+        var query = QueryHelpers.ParseQuery(response.Headers.Location!.Query);
+        Assert.Equal("https://runners.example.com:8443/signin-oidc", query["redirect_uri"].ToString());
+    }
+
+    [Theory]
+    [InlineData(null, "http://internal.test/signin-oidc")]
+    [InlineData("", "http://internal.test/signin-oidc")]
+    [InlineData("https://runners.example.com/", "https://runners.example.com/signin-oidc")]
+    public async Task LoginUsesExistingRedirectWhenPublicOriginIsUnsetOrAcceptsTrailingSlash(
+        string? publicBaseUrl,
+        string expectedRedirect)
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?> { ["Entra:PublicBaseUrl"] = publicBaseUrl });
+        using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+            BaseAddress = new Uri("http://internal.test")
+        });
+
+        var response = await client.GetAsync("/login");
+
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.Equal(expectedRedirect, QueryHelpers.ParseQuery(response.Headers.Location!.Query)["redirect_uri"].ToString());
+    }
+
+    [Fact]
+    public async Task LogoutUsesConfiguredPublicHttpsOriginInsteadOfRequestHost()
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?> { ["Entra:PublicBaseUrl"] = "https://runners.example.com" });
+        using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+            BaseAddress = new Uri("http://internal.test")
+        });
+        client.DefaultRequestHeaders.Host = "hostile.example";
+
+        var response = await client.PostAsync("/logout", null);
+
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.Equal("https://runners.example.com/signout-callback-oidc",
+            QueryHelpers.ParseQuery(response.Headers.Location!.Query)["post_logout_redirect_uri"].ToString());
+    }
+
+    [Theory]
+    [InlineData("http://runners.example.com")]
+    [InlineData("runners.example.com")]
+    [InlineData("https://user@runners.example.com")]
+    [InlineData("https://runners.example.com/path")]
+    [InlineData("https://runners.example.com/path/..")]
+    [InlineData("https://runners.example.com?query")]
+    [InlineData("https://runners.example.com?")]
+    [InlineData("https://runners.example.com#fragment")]
+    [InlineData("https://runners.example.com#")]
+    [InlineData("https://runners.example.com\\path")]
+    [InlineData(" ")]
+    public void InvalidPublicOriginIsRejectedAtStartup(string publicBaseUrl)
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?> { ["Entra:PublicBaseUrl"] = publicBaseUrl });
+
+        var exception = Record.Exception(() => factory.CreateClient());
+
+        Assert.NotNull(exception);
+        Assert.Contains("Entra:PublicBaseUrl must be an absolute HTTPS origin", exception.ToString());
     }
 
     [Fact]
@@ -205,16 +313,149 @@ public sealed class RunnerAccessEndpointTests
         Assert.Contains("Entra:ReadOnlyGroupId and Entra:OperatorGroupId must be different", exception.ToString());
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("http://storage.example")]
+    [InlineData("https://storage.example/path")]
+    [InlineData("https://storage.example/?token=secret")]
+    public void InvalidTableStorageEndpointIsRejectedAtStartup(string endpoint)
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["TableStorage:Enabled"] = "true",
+                ["TableStorage:Endpoint"] = endpoint,
+                ["DataProtection:BlobUri"] = "https://storage.example/dataprotection/keys.xml",
+                ["DataProtection:KeyUri"] = "https://vault.example/keys/example"
+            });
+
+        var exception = Record.Exception(() => factory.CreateClient());
+
+        Assert.NotNull(exception);
+        Assert.Contains("TableStorage:Endpoint must be an HTTPS table service origin", exception.ToString());
+    }
+
+    [Theory]
+    [InlineData("DataProtection:BlobUri", "")]
+    [InlineData("DataProtection:BlobUri", "http://storage.example/keys.xml")]
+    [InlineData("DataProtection:KeyUri", "https://vault.example/keys/key?secret=value")]
+    public void InvalidSharedDataProtectionConfigurationIsRejected(string name, string value)
+    {
+        var settings = new Dictionary<string, string?>
+        {
+            ["TableStorage:Enabled"] = "true",
+            ["TableStorage:Endpoint"] = "https://storage.example/",
+            ["DataProtection:BlobUri"] = "https://storage.example/dataprotection/keys.xml",
+            ["DataProtection:KeyUri"] = "https://vault.example/keys/example"
+        };
+        settings[name] = value;
+        using var factory = new RunnerControlPlaneFactory(configurationOverrides: settings);
+
+        var exception = Record.Exception(() => factory.CreateClient());
+
+        Assert.NotNull(exception);
+        Assert.Contains("DataProtection:BlobUri and DataProtection:KeyUri must be HTTPS resource URIs", exception.ToString());
+    }
+
+    [Fact]
+    public async Task ReadinessRejectsFileBasedState()
+    {
+        using var factory = new RunnerControlPlaneFactory();
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/health/ready");
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(null, null, HttpStatusCode.OK)]
+    [InlineData("RunnerVms", null, HttpStatusCode.ServiceUnavailable)]
+    [InlineData("RunnerRollouts", null, HttpStatusCode.ServiceUnavailable)]
+    [InlineData(null, "RunnerCapacity", HttpStatusCode.ServiceUnavailable)]
+    [InlineData(null, "RunnerVms", HttpStatusCode.ServiceUnavailable)]
+    [InlineData(null, "RunnerRollouts", HttpStatusCode.ServiceUnavailable)]
+    public async Task ReadinessChecksSharedStores(string? failingTable, string? blockedTable, HttpStatusCode expected)
+    {
+        using var factory = new RunnerControlPlaneFactory(
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["TableStorage:Enabled"] = "true",
+                ["TableStorage:Endpoint"] = "https://storage.example/",
+                ["DataProtection:BlobUri"] = "https://storage.example/dataprotection/keys.xml",
+                ["DataProtection:KeyUri"] = "https://vault.example/keys/example"
+            },
+            fakeReadiness: true,
+            failingTable: failingTable,
+            blockedTable: blockedTable);
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/health/ready");
+
+        Assert.Equal(expected, response.StatusCode);
+    }
+
+    [CollectionDefinition("Runner access startup", DisableParallelization = true)]
+    public sealed class RunnerAccessStartupCollection;
+
+    private sealed class ReadinessTableServiceClient(string? failingTable, string? blockedTable) : TableServiceClient
+    {
+        public override TableClient GetTableClient(string tableName)
+        {
+            if (tableName != blockedTable)
+            {
+                return new ReadinessTableClient(tableName == failingTable);
+            }
+
+            var table = new RunnerVmEndpointTests.TestTableClient();
+            var partition = tableName switch
+            {
+                "RunnerCapacity" => "runner-capacity",
+                "RunnerVms" => "runner-vm-import",
+                _ => "runner-rollout-import"
+            };
+            table.AddEntity(new TableEntity(partition, tableName == "RunnerCapacity" ? "settings" : "guard")
+            {
+                ["Owner"] = "migration"
+            });
+            return table;
+        }
+    }
+
+    private sealed class ReadinessTableClient(bool fail) : TableClient
+    {
+        public override Pageable<T> Query<T>(
+            string? filter = null, int? maxPerPage = null, IEnumerable<string>? select = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (fail)
+            {
+                throw new RequestFailedException(503, "Table unavailable.");
+            }
+
+            return Pageable<T>.FromPages([]);
+        }
+    }
+
     private sealed class RunnerControlPlaneFactory : WebApplicationFactory<Program>
     {
         private readonly IReadOnlyDictionary<string, string?> _configurationOverrides;
+        private readonly bool _fakeReadiness;
+        private readonly string? _failingTable;
+        private readonly string? _blockedTable;
 
         public RunnerControlPlaneFactory(
             bool groupAllowsAllRepositories = false,
-            IReadOnlyDictionary<string, string?>? configurationOverrides = null)
+            IReadOnlyDictionary<string, string?>? configurationOverrides = null,
+            bool fakeReadiness = false,
+            string? failingTable = null,
+            string? blockedTable = null)
         {
             GitHubApi = new FakeGitHubApiHandler(groupAllowsAllRepositories);
             _configurationOverrides = configurationOverrides ?? new Dictionary<string, string?>();
+            _fakeReadiness = fakeReadiness;
+            _failingTable = failingTable;
+            _blockedTable = blockedTable;
         }
 
         public FakeGitHubApiHandler GitHubApi { get; }
@@ -246,6 +487,20 @@ public sealed class RunnerAccessEndpointTests
 
             builder.ConfigureTestServices(services =>
             {
+                if (_fakeReadiness)
+                {
+                    services.RemoveAll<TableServiceClient>();
+                    services.AddSingleton<TableServiceClient>(new ReadinessTableServiceClient(_failingTable, _blockedTable));
+                    services.RemoveAll<IDataProtectionProvider>();
+                    services.AddSingleton<IDataProtectionProvider>(new EphemeralDataProtectionProvider());
+                }
+                services.PostConfigure<OpenIdConnectOptions>("entra", options =>
+                    options.ConfigurationManager = new Microsoft.IdentityModel.Protocols.StaticConfigurationManager<Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration>(
+                        new Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration
+                        {
+                            AuthorizationEndpoint = "https://login.example.test/authorize",
+                            EndSessionEndpoint = "https://login.example.test/logout"
+                        }));
                 services.RemoveAll<IGitHubRunnerCapacityClient>();
                 services.AddSingleton<IGitHubRunnerCapacityClient, TestGitHubRunnerCapacityClient>();
                 services.RemoveAll<IGitHubRunnerGroupClient>();

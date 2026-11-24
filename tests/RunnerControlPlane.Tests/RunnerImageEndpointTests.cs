@@ -3,6 +3,9 @@ using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Azure;
+using Azure.Core;
+using Azure.Data.Tables;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -43,6 +46,158 @@ public sealed class RunnerImageEndpointTests
     }
 
     [Fact]
+    public async Task TableStoreSharesImagesAndReevaluatesConcurrentResultsAcrossInstances()
+    {
+        var table = new TestTableClient();
+        var firstStore = new AzureTableRunnerImageStore(table);
+        var secondStore = new AzureTableRunnerImageStore(table);
+        using var firstFactory = new RunnerImageControlPlaneFactory(store: firstStore);
+        using var secondFactory = new RunnerImageControlPlaneFactory(store: secondStore);
+        using var first = firstFactory.CreateClient();
+        using var second = secondFactory.CreateClient();
+        first.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        second.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+
+        var registered = await (await RequestBuildAsync(first)).Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        Assert.NotNull(registered);
+        var visible = await second.GetFromJsonAsync<RunnerImage>($"/api/runner-images/{registered.Version}", JsonOptions);
+        Assert.Equal(registered.ManifestDigest, visible!.ManifestDigest);
+
+        var winner = CreateResult(registered);
+        var loser = winner with { AzureImageId = "/different-image" };
+        table.BeforeNextUpdate = () =>
+            Assert.Equal(RunnerImageBuildResultStatus.Recorded,
+                secondStore.ReportBuildResult(registered.Version, winner, "other-instance").Status);
+        var rejected = await first.PostAsJsonAsync($"/api/runner-images/{registered.Version}/result", loser);
+        var retry = await first.PostAsJsonAsync($"/api/runner-images/{registered.Version}/result", winner);
+        var available = await second.GetFromJsonAsync<RunnerImage[]>("/api/runner-images/available", JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Conflict, rejected.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, retry.StatusCode);
+        var persisted = Assert.Single(available!);
+        Assert.Equal(winner.AzureImageId, persisted.AzureImageId);
+        Assert.Equal(2, persisted.AuditTrail!.Count);
+        Assert.Equal("other-instance", persisted.AuditTrail.Last().Actor);
+    }
+
+    [Fact]
+    public async Task TableStoreRetriesUpdatesWithoutLosingConcurrentChanges()
+    {
+        var table = new TestTableClient();
+        var firstStore = new AzureTableRunnerImageStore(table);
+        var secondStore = new AzureTableRunnerImageStore(table);
+        using var factory = new RunnerImageControlPlaneFactory(store: firstStore);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var registered = await (await RequestBuildAsync(client)).Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        Assert.NotNull(registered);
+
+        table.BeforeNextUpdate = () =>
+            secondStore.Update(registered.Version, image => image with { FailureReason = "concurrent" });
+        firstStore.Update(registered.Version, image => image with { Status = RunnerImageBuildStatus.Validating });
+
+        var persisted = await client.GetFromJsonAsync<RunnerImage>($"/api/runner-images/{registered.Version}", JsonOptions);
+        Assert.Equal(RunnerImageBuildStatus.Validating, persisted!.Status);
+        Assert.Equal("concurrent", persisted.FailureReason);
+    }
+
+    [Fact]
+    public async Task JsonImportIsExplicitAndRejectsConflictsBeforeInsertingAnything()
+    {
+        var path = Path.Combine(Directory.GetCurrentDirectory(), $"image-import-{Guid.NewGuid():N}.json");
+        try
+        {
+            var table = new TestTableClient();
+            var store = new AzureTableRunnerImageStore(table);
+            using var factory = new RunnerImageControlPlaneFactory(store: store);
+            using var client = factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+            var existing = await (await RequestBuildAsync(client)).Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+            Assert.NotNull(existing);
+            var other = existing with { Version = "import/with#special?characters" };
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(new { images = new[] { other, existing } }));
+
+            Assert.Throws<InvalidOperationException>(() => store.ImportJsonFile(path));
+            Assert.Null(store.Get(other.Version));
+
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(new { images = new[] { other } }));
+            store.ImportJsonFile(path);
+            var all = await client.GetFromJsonAsync<RunnerImage[]>("/api/runner-images", JsonOptions);
+            Assert.Contains(all!, image => image.Version == other.Version);
+            Assert.Throws<InvalidOperationException>(() => store.ImportJsonFile(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task JsonImportReportsPartialFailureWhenAConcurrentWriterWins()
+    {
+        var path = Path.Combine(Directory.GetCurrentDirectory(), $"image-import-{Guid.NewGuid():N}.json");
+        try
+        {
+            var table = new TestTableClient();
+            var store = new AzureTableRunnerImageStore(table);
+            var request = new RunnerImageBuildRequest("24.04", [], new Dictionary<string, string>(), "2.331.0");
+            var first = new RunnerImage("first", DateTimeOffset.UtcNow, false, request, RunnerImageBuildStatus.Complete, null, null);
+            var second = first with { Version = "second" };
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(new { images = new[] { first, second } }));
+            table.BeforeNextAdd = () => store.AddQueued("second", request);
+
+            var error = Assert.Throws<InvalidOperationException>(() => store.ImportJsonFile(path));
+
+            Assert.Contains("may be partial", error.Message);
+            Assert.NotNull(store.Get("first"));
+            Assert.NotNull(store.Get("second"));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Theory]
+    [InlineData(RunnerImageBuildStatus.Queued)]
+    [InlineData(RunnerImageBuildStatus.Building)]
+    [InlineData(RunnerImageBuildStatus.Validating)]
+    public async Task JsonImportRejectsUnfinishedLocalBuilds(RunnerImageBuildStatus status)
+    {
+        var path = Path.Combine(Directory.GetCurrentDirectory(), $"image-import-{Guid.NewGuid():N}.json");
+        try
+        {
+            var table = new TestTableClient();
+            var store = new AzureTableRunnerImageStore(table);
+            var request = new RunnerImageBuildRequest("24.04", [], new Dictionary<string, string>(), "2.331.0");
+            var image = new RunnerImage("unfinished", DateTimeOffset.UtcNow, false, request, status, null, null);
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(new { images = new[] { image } }));
+
+            var error = Assert.Throws<InvalidDataException>(() => store.ImportJsonFile(path));
+
+            Assert.Contains("unfinished local builds", error.Message);
+            Assert.Null(store.Get(image.Version));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void MissingTableIsNotTreatedAsMissingImage()
+    {
+        var table = new TestTableClient
+        {
+            ReadFailure = new RequestFailedException(404, "Table not found", "TableNotFound", null)
+        };
+        var store = new AzureTableRunnerImageStore(table);
+
+        var error = Assert.Throws<RequestFailedException>(() => store.Get("any-image"));
+        Assert.Equal("TableNotFound", error.ErrorCode);
+    }
+
+    [Fact]
     public async Task OperatorCanBuildAndInspectAValidatedImageInventory()
     {
         using var factory = new RunnerImageControlPlaneFactory();
@@ -77,6 +232,60 @@ public sealed class RunnerImageEndpointTests
         Assert.False(string.IsNullOrWhiteSpace(buildId.GetString()));
         Assert.True(registration.TryGetProperty("manifestDigest", out var manifestDigest));
         Assert.Matches("^[a-f0-9]{64}$", manifestDigest.GetString());
+    }
+
+    [Fact]
+    public async Task ConfiguredWorkloadIdentityCanRegisterAScheduledImageBuild()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "image-builder");
+
+        var response = await RequestBuildAsync(client, expedited: false);
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var registration = await response.Content.ReadFromJsonAsync<RunnerImage>(JsonOptions);
+        Assert.NotNull(registration);
+        Assert.False(registration.Expedited);
+        Assert.False(string.IsNullOrWhiteSpace(registration.BuildId));
+        Assert.Matches("^[a-f0-9]{64}$", registration.ManifestDigest);
+    }
+
+    [Theory]
+    [InlineData("operator", HttpStatusCode.Accepted)]
+    [InlineData("reader", HttpStatusCode.Forbidden)]
+    [InlineData("wrong-image-builder", HttpStatusCode.Forbidden)]
+    [InlineData("delegated-image-builder", HttpStatusCode.Forbidden)]
+    [InlineData("scoped-image-builder", HttpStatusCode.Forbidden)]
+    [InlineData("missing-idtyp-image-builder", HttpStatusCode.Forbidden)]
+    [InlineData("appid-image-builder", HttpStatusCode.Accepted)]
+    public async Task ScheduledImageBuildRegistrationRequiresOperatorOrConfiguredAppOnlyIdentity(
+        string role,
+        HttpStatusCode expectedStatus)
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", role);
+
+        var response = await RequestBuildAsync(client, expedited: false);
+
+        Assert.Equal(expectedStatus, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task WorkloadIdentityCannotManageOtherResources()
+    {
+        using var factory = new RunnerImageControlPlaneFactory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "image-builder");
+
+        var rollout = await client.PostAsJsonAsync("/api/runner-images/rollout", new { imageVersion = "image" });
+        var capacity = await client.PostAsJsonAsync("/api/runner-capacity/scale-out", new { count = 1 });
+        var vm = await client.PostAsJsonAsync("/api/runner-vms", new CreateRunnerVmRequest("image"));
+
+        Assert.Equal(HttpStatusCode.Forbidden, rollout.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, capacity.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, vm.StatusCode);
     }
 
     [Fact]
@@ -483,6 +692,112 @@ public sealed class RunnerImageEndpointTests
     }
 
     [Fact]
+    public async Task RolloutSnapshotImportPreservesAuditAndBlocksPartialImport()
+    {
+        using var sourceFactory = new RunnerImageControlPlaneFactory();
+        using var source = sourceFactory.CreateClient();
+        source.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var image = await RegisterAndCompleteBuildAsync(source);
+        var rollout = await (await source.PostAsJsonAsync("/api/runner-images/rollouts", new { imageVersion = image.Version }))
+            .Content.ReadFromJsonAsync<RunnerImageRollout>(JsonOptions);
+        Assert.NotNull(rollout);
+        var records = await source.GetStringAsync("/api/runner-images/rollouts");
+        var audit = await source.GetStringAsync("/api/runner-images/rollouts/audit");
+        var table = new RunnerVmEndpointTests.TestTableClient();
+        var store = new AzureTableRunnerImageRolloutStore(table);
+        store.ImportJson(records, audit);
+        using var targetFactory = new RunnerImageControlPlaneFactory(rolloutStore: store);
+        using var target = targetFactory.CreateClient();
+        target.DefaultRequestHeaders.Add("X-Test-Role", "reader");
+        var imported = await target.GetFromJsonAsync<RunnerImageRollout>($"/api/runner-images/rollouts/{rollout.Id}", JsonOptions);
+        Assert.Equal(RunnerImageRolloutStage.Canary, imported!.Stage);
+        Assert.Equal(2, (await target.GetFromJsonAsync<RunnerImageRolloutAuditRecord[]>("/api/runner-images/rollouts/audit", JsonOptions))!.Length);
+        Assert.Throws<InvalidOperationException>(() => store.ImportJson(records, audit));
+        Assert.Throws<InvalidOperationException>(() => store.ImportJson("[]", "[]"));
+        Assert.Throws<InvalidDataException>(() => new AzureTableRunnerImageRolloutStore(new RunnerVmEndpointTests.TestTableClient()).ImportJson(records, "[]"));
+        var partial = new AzureTableRunnerImageRolloutStore(new RunnerVmEndpointTests.TestTableClient { FailAddAfter = 1 });
+        Assert.Throws<InvalidOperationException>(() => partial.ImportJson(records, audit));
+        using var partialFactory = new RunnerImageControlPlaneFactory(rolloutStore: partial);
+        using var partialClient = partialFactory.CreateClient();
+        partialClient.DefaultRequestHeaders.Add("X-Test-Role", "reader");
+        var response = await partialClient.GetAsync("/api/runner-images/rollouts");
+        Assert.False(response.IsSuccessStatusCode);
+    }
+
+    [Fact]
+    public async Task TableRolloutSurvivesRestartAndRetriesInterleavedAuditUpdates()
+    {
+        var table = new RunnerVmEndpointTests.TestTableClient();
+        var images = new InMemoryRunnerImageStore();
+        using var firstFactory = new RunnerImageControlPlaneFactory(store: images, rolloutStore: new AzureTableRunnerImageRolloutStore(table));
+        using var secondFactory = new RunnerImageControlPlaneFactory(store: images, rolloutStore: new AzureTableRunnerImageRolloutStore(table));
+        using var first = firstFactory.CreateClient();
+        using var second = secondFactory.CreateClient();
+        first.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        second.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var image = await RegisterAndCompleteBuildAsync(first);
+        var rollout = await (await first.PostAsJsonAsync("/api/runner-images/rollouts", new { imageVersion = image.Version }))
+            .Content.ReadFromJsonAsync<RunnerImageRollout>(JsonOptions);
+        Assert.NotNull(rollout);
+        Assert.NotNull(await second.GetFromJsonAsync<RunnerImageRollout>($"/api/runner-images/rollouts/{rollout.Id}", JsonOptions));
+
+        table.BeforeNextUpdate = () =>
+        {
+            var concurrent = new AzureTableRunnerImageRolloutStore(table);
+            concurrent.Update(rollout.Id, current => current with
+            {
+                AuditTrail = [.. current.AuditTrail!, new RunnerImageRolloutAuditRecord("other", DateTimeOffset.UtcNow, "concurrent", "ok")]
+            });
+        };
+        var success = await first.PostAsJsonAsync($"/api/runner-images/rollouts/{rollout.Id}/canary/success", new { });
+        Assert.Equal(HttpStatusCode.OK, success.StatusCode);
+
+        using var restartedFactory = new RunnerImageControlPlaneFactory(store: images, rolloutStore: new AzureTableRunnerImageRolloutStore(table));
+        using var restarted = restartedFactory.CreateClient();
+        restarted.DefaultRequestHeaders.Add("X-Test-Role", "reader");
+        var persisted = await restarted.GetFromJsonAsync<RunnerImageRollout>($"/api/runner-images/rollouts/{rollout.Id}", JsonOptions);
+        Assert.Equal(RunnerImageRolloutStage.Completed, persisted!.Stage);
+        Assert.Contains(persisted.AuditTrail!, entry => entry.Action == "concurrent");
+        var audit = await restarted.GetFromJsonAsync<RunnerImageRolloutAuditRecord[]>("/api/runner-images/rollouts/audit", JsonOptions);
+        Assert.Equal(4, audit!.Length);
+        Assert.Contains(audit, entry => entry.Action == "canary-succeeded");
+    }
+
+    [Fact]
+    public async Task RolloutCannotRunWhileAnotherHostOwnsTheVmOperationLock()
+    {
+        var table = new RunnerVmEndpointTests.TestTableClient();
+        using var factory = new RunnerImageControlPlaneFactory(
+            rolloutStore: new AzureTableRunnerImageRolloutStore(table),
+            operationLock: new AzureTableRunnerVmOperationLock(table));
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var image = await RegisterAndCompleteBuildAsync(client);
+        var lease = await new AzureTableRunnerVmOperationLock(table).AcquireAsync(CancellationToken.None);
+        var blocked = await client.PostAsJsonAsync("/api/runner-images/rollouts", new { imageVersion = image.Version });
+        Assert.False(blocked.IsSuccessStatusCode);
+        lease.Complete();
+        var accepted = await client.PostAsJsonAsync("/api/runner-images/rollouts", new { imageVersion = image.Version });
+        Assert.Equal(HttpStatusCode.Accepted, accepted.StatusCode);
+    }
+
+    [Fact]
+    public async Task MissingRolloutDoesNotBlockLaterRolloutOperations()
+    {
+        var table = new RunnerVmEndpointTests.TestTableClient();
+        using var factory = new RunnerImageControlPlaneFactory(
+            rolloutStore: new AzureTableRunnerImageRolloutStore(table),
+            operationLock: new AzureTableRunnerVmOperationLock(table));
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Test-Role", "operator");
+        var image = await RegisterAndCompleteBuildAsync(client);
+        var missing = await client.PostAsJsonAsync("/api/runner-images/rollouts/missing/canary/success", new { });
+        Assert.False(missing.IsSuccessStatusCode);
+        var created = await client.PostAsJsonAsync("/api/runner-images/rollouts", new { imageVersion = image.Version });
+        Assert.Equal(HttpStatusCode.Accepted, created.StatusCode);
+    }
+
+    [Fact]
     public async Task OperatorCanStartACanaryRolloutForAValidatedImage()
     {
         using var factory = new RunnerImageControlPlaneFactory();
@@ -564,7 +879,8 @@ public sealed class RunnerImageEndpointTests
             "/api/runner-images/rollouts/audit",
             JsonOptions);
 
-        Assert.NotEmpty(audit!);
+        Assert.NotNull(audit);
+        Assert.NotEmpty(audit);
         Assert.Contains(audit, record => record.Action == "request-rollout" && record.Outcome == "queued");
         Assert.Contains(audit, record => record.Action == "canary-started" && record.Outcome == "canary");
         Assert.Contains(audit, record => record.Action == "canary-succeeded" && record.Outcome == "succeeded");
@@ -632,10 +948,17 @@ public sealed class RunnerImageEndpointTests
     private sealed class RunnerImageControlPlaneFactory : WebApplicationFactory<Program>
     {
         private readonly string? _stateFilePath;
+        private readonly IRunnerImageStore? _store;
+        private readonly IRunnerImageRolloutStore? _rolloutStore;
+        private readonly IRunnerVmOperationLock? _operationLock;
 
-        public RunnerImageControlPlaneFactory(string? stateFilePath = null)
+        public RunnerImageControlPlaneFactory(string? stateFilePath = null, IRunnerImageStore? store = null,
+            IRunnerImageRolloutStore? rolloutStore = null, IRunnerVmOperationLock? operationLock = null)
         {
             _stateFilePath = stateFilePath;
+            _store = store;
+            _rolloutStore = rolloutStore;
+            _operationLock = operationLock;
         }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -661,6 +984,21 @@ public sealed class RunnerImageEndpointTests
 
             builder.ConfigureTestServices(services =>
             {
+                if (_store is not null)
+                {
+                    services.RemoveAll<IRunnerImageStore>();
+                    services.AddSingleton(_store);
+                }
+                if (_rolloutStore is not null)
+                {
+                    services.RemoveAll<IRunnerImageRolloutStore>();
+                    services.AddSingleton(_rolloutStore);
+                }
+                if (_operationLock is not null)
+                {
+                    services.RemoveAll<IRunnerVmOperationLock>();
+                    services.AddSingleton(_operationLock);
+                }
                 services.RemoveAll<IGitHubRunnerCapacityClient>();
                 services.AddSingleton<IGitHubRunnerCapacityClient, TestGitHubRunnerCapacityClient>();
                 services.AddAuthentication()
@@ -676,6 +1014,102 @@ public sealed class RunnerImageEndpointTests
                 });
             });
         }
+    }
+
+    private sealed class TestTableClient : TableClient
+    {
+        private readonly Dictionary<(string, string), TableEntity> _rows = new();
+        private readonly object _lock = new();
+        private int _revision;
+        public Action? BeforeNextAdd { get; set; }
+        public Action? BeforeNextUpdate { get; set; }
+        public RequestFailedException? ReadFailure { get; set; }
+
+        public override Response AddEntity<T>(T entity, CancellationToken cancellationToken = default)
+        {
+            var callback = BeforeNextAdd;
+            BeforeNextAdd = null;
+            callback?.Invoke();
+            var row = (TableEntity)(object)entity;
+            lock (_lock)
+            {
+                if (_rows.ContainsKey((row.PartitionKey, row.RowKey)))
+                {
+                    throw new RequestFailedException(409, "Already exists");
+                }
+                _rows.Add((row.PartitionKey, row.RowKey), Copy(row, new ETag((++_revision).ToString())));
+                return new TestResponse();
+            }
+        }
+
+        public override Response<T> GetEntity<T>(
+            string partitionKey, string rowKey, IEnumerable<string>? select = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (ReadFailure is not null)
+            {
+                throw ReadFailure;
+            }
+            lock (_lock)
+            {
+                if (!_rows.TryGetValue((partitionKey, rowKey), out var row))
+                {
+                    throw new RequestFailedException(404, "Not found", "ResourceNotFound", null);
+                }
+                return Response.FromValue((T)(object)Copy(row, row.ETag), new TestResponse());
+            }
+        }
+
+        public override Response UpdateEntity<T>(
+            T entity, ETag ifMatch, TableUpdateMode mode = TableUpdateMode.Merge,
+            CancellationToken cancellationToken = default)
+        {
+            var callback = BeforeNextUpdate;
+            BeforeNextUpdate = null;
+            callback?.Invoke();
+            var row = (TableEntity)(object)entity;
+            lock (_lock)
+            {
+                if (!_rows.TryGetValue((row.PartitionKey, row.RowKey), out var current))
+                {
+                    throw new RequestFailedException(404, "Not found");
+                }
+                if (current.ETag != ifMatch)
+                {
+                    throw new RequestFailedException(412, "Precondition failed");
+                }
+                _rows[(row.PartitionKey, row.RowKey)] = Copy(row, new ETag((++_revision).ToString()));
+                return new TestResponse();
+            }
+        }
+
+        public override Pageable<T> Query<T>(
+            string? filter = null, int? maxPerPage = null, IEnumerable<string>? select = null,
+            CancellationToken cancellationToken = default)
+        {
+            lock (_lock)
+            {
+                var rows = _rows.Values.Where(row => row.PartitionKey == "runner-images")
+                    .Select(row => (T)(object)Copy(row, row.ETag)).ToArray();
+                return Pageable<T>.FromPages([Page<T>.FromValues(rows, null, new TestResponse())]);
+            }
+        }
+
+        private static TableEntity Copy(TableEntity row, ETag etag) =>
+            new(row.PartitionKey, row.RowKey) { ETag = etag, ["Image"] = row["Image"] };
+    }
+
+    private sealed class TestResponse : Response
+    {
+        public override int Status => 200;
+        public override string ReasonPhrase => "OK";
+        public override Stream? ContentStream { get; set; }
+        public override string ClientRequestId { get; set; } = "";
+        public override void Dispose() { }
+        protected override bool ContainsHeader(string name) => false;
+        protected override IEnumerable<HttpHeader> EnumerateHeaders() => [];
+        protected override bool TryGetHeader(string name, out string value) { value = ""; return false; }
+        protected override bool TryGetHeaderValues(string name, out IEnumerable<string> values) { values = []; return false; }
     }
 
     private sealed class TestAuthenticationHandler(
@@ -694,6 +1128,26 @@ public sealed class RunnerImageEndpointTests
                 [
                     new Claim("azp", "image-builder-client"),
                     new Claim("idtyp", "app")
+                ],
+                "appid-image-builder" =>
+                [
+                    new Claim("appid", "image-builder-client"),
+                    new Claim("idtyp", "app")
+                ],
+                "wrong-image-builder" =>
+                [
+                    new Claim("azp", "other-client"),
+                    new Claim("idtyp", "app")
+                ],
+                "missing-idtyp-image-builder" =>
+                [
+                    new Claim("azp", "image-builder-client")
+                ],
+                "scoped-image-builder" =>
+                [
+                    new Claim("azp", "image-builder-client"),
+                    new Claim("idtyp", "app"),
+                    new Claim("scp", "image.result")
                 ],
                 "delegated-image-builder" =>
                 [

@@ -1,0 +1,29 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build RunnerControlPlane",
+            "command": "dotnet",
+            "type": "process",
+            "args": [
+                "build",
+                "${workspaceFolder}/src/RunnerControlPlane/RunnerControlPlane.csproj",
+                "--configuration",
+                "Debug"
+            ],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "build RunnerImageManifestResolver",
+            "command": "dotnet",
+            "type": "process",
+            "args": [
+                "build",
+                "${workspaceFolder}/src/RunnerImageManifestResolver/RunnerImageManifestResolver.csproj",
+                "--configuration",
+                "Debug"
+            ],
+            "problemMatcher": "$msCompile"
+        }
+    ]
+}

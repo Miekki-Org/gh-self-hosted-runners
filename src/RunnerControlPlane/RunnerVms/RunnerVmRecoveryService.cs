@@ -25,9 +25,9 @@ public interface IRunnerVmRecoveryService
 public sealed class RunnerVmRecoveryService(
     IRunnerVmStore runnerVms,
     IRunnerCapacityController capacity,
-    IOptions<RunnerVmOptions> options) : IRunnerVmRecoveryService
+    IOptions<RunnerVmOptions> options,
+    IRunnerVmOperationLock operationLock) : IRunnerVmRecoveryService
 {
-    private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly int _healthFailureThreshold = options.Value.HealthFailureThreshold;
 
     public async Task<RunnerVmRecord?> RecordHealthCheckAsync(
@@ -35,23 +35,28 @@ public sealed class RunnerVmRecoveryService(
         RunnerVmHealthCheckRequest request,
         CancellationToken cancellationToken)
     {
-        await _gate.WaitAsync(cancellationToken);
+        var lease = await operationLock.AcquireAsync(cancellationToken);
+        var completed = false;
+        var mutationStarted = false;
         try
         {
             var current = runnerVms.Get(id);
             if (current is null)
             {
+                completed = true;
                 return null;
             }
 
             if (current.IsRetired)
             {
+                completed = true;
                 return current;
             }
 
+            mutationStarted = true;
             var updated = runnerVms.Update(id, vm =>
             {
-                if (vm.IsUnhealthy)
+                if (vm.IsUnhealthy || vm.IsRetired)
                 {
                     return vm;
                 }
@@ -93,14 +98,17 @@ public sealed class RunnerVmRecoveryService(
                 && updated.Status is RunnerVmStatus.Idle or RunnerVmStatus.Finished
                 && !updated.IsRetired)
             {
-                return await RetireAndReplaceAsync(updated, "system", "automatic-unhealthy-retire", cancellationToken);
+                var retired = await RetireAndReplaceAsync(updated, "system", "automatic-unhealthy-retire", cancellationToken);
+                completed = true;
+                return retired;
             }
 
+            completed = true;
             return updated;
         }
         finally
         {
-            _gate.Release();
+            if (completed || !mutationStarted) lease.Complete();
         }
     }
 
@@ -109,47 +117,65 @@ public sealed class RunnerVmRecoveryService(
         UpdateRunnerVmStatusRequest request,
         CancellationToken cancellationToken)
     {
-        await _gate.WaitAsync(cancellationToken);
+        var lease = await operationLock.AcquireAsync(cancellationToken);
+        var completed = false;
+        var mutationStarted = false;
         try
         {
             var existing = runnerVms.Get(id);
             if (existing is null)
             {
+                completed = true;
                 return null;
             }
 
             if (request.Status == RunnerVmStatus.Working && !existing.AcceptingJobs)
             {
+                completed = true;
                 throw new RunnerVmNotAcceptingJobsException();
             }
 
-            var updated = runnerVms.Update(id, current => current with
+            mutationStarted = true;
+            var updated = runnerVms.Update(id, current =>
             {
-                Status = request.Status,
-                JobStatus = request.Status.ToString().ToLowerInvariant(),
-                Outcome = request.Outcome ?? current.Outcome,
-                FailureReason = request.Error ?? current.FailureReason,
-                IsRetired = request.IsRetired ?? current.IsRetired,
-                RetryScheduled = request.RetryScheduled ?? current.RetryScheduled,
-                AcceptingJobs = current.AcceptingJobs
+                if (request.Status == RunnerVmStatus.Working && !current.AcceptingJobs)
+                    throw new RunnerVmNotAcceptingJobsException();
+                return current with
+                {
+                    Status = request.Status,
+                    JobStatus = request.Status.ToString().ToLowerInvariant(),
+                    Outcome = request.Outcome ?? current.Outcome,
+                    FailureReason = request.Error ?? current.FailureReason,
+                    IsRetired = request.IsRetired ?? current.IsRetired,
+                    RetryScheduled = request.RetryScheduled ?? current.RetryScheduled,
+                    AcceptingJobs = current.AcceptingJobs
                     && request.Status != RunnerVmStatus.Finished
                     && !current.IsUnhealthy
                     && !(request.IsRetired ?? current.IsRetired),
-                UpdatedAt = DateTimeOffset.UtcNow
+                    UpdatedAt = DateTimeOffset.UtcNow
+                };
             });
 
             if (updated.IsUnhealthy
                 && updated.Status is RunnerVmStatus.Idle or RunnerVmStatus.Finished
                 && !updated.IsRetired)
             {
-                return await RetireAndReplaceAsync(updated, "system", "automatic-unhealthy-retire", cancellationToken);
+                var retired = await RetireAndReplaceAsync(updated, "system", "automatic-unhealthy-retire", cancellationToken);
+                completed = true;
+                return retired;
             }
 
+            completed = true;
             return updated;
+        }
+        catch (RunnerVmNotAcceptingJobsException)
+        {
+            completed = true;
+            throw;
         }
         finally
         {
-            _gate.Release();
+            if (completed || !mutationStarted) lease.Complete();
         }
     }
 
@@ -158,12 +184,15 @@ public sealed class RunnerVmRecoveryService(
         string actor,
         CancellationToken cancellationToken)
     {
-        await _gate.WaitAsync(cancellationToken);
+        var lease = await operationLock.AcquireAsync(cancellationToken);
+        var completed = false;
+        var mutationStarted = false;
         try
         {
             var vm = runnerVms.Get(id);
             if (vm is null || vm.IsRetired)
             {
+                completed = true;
                 return vm;
             }
 
@@ -171,6 +200,7 @@ public sealed class RunnerVmRecoveryService(
             string? message = vm.HealthFailureReason;
             try
             {
+                mutationStarted = true;
                 var scaleOut = await capacity.RequestScaleOutAsync(1, actor, cancellationToken);
                 outcome = scaleOut.AddedCount == 0 ? "replacement-capped" : "Success";
                 if (scaleOut.AddedCount > 0)
@@ -188,11 +218,13 @@ public sealed class RunnerVmRecoveryService(
                 throw;
             }
 
-            return runnerVms.Retire(id, outcome, actor, message, "force-remove");
+            var retired = runnerVms.Retire(id, outcome, actor, message, "force-remove");
+            completed = true;
+            return retired;
         }
         finally
         {
-            _gate.Release();
+            if (completed || !mutationStarted) lease.Complete();
         }
     }
 

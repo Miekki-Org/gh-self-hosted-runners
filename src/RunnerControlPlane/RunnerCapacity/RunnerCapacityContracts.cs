@@ -92,5 +92,18 @@ public interface IRunnerCapacityStateStore
 {
     RunnerCapacityState? Load();
 
-    Task SaveAsync(RunnerCapacityState state, CancellationToken cancellationToken);
+    Task<IRunnerCapacityStateLease> AcquireAsync(
+        int defaultMinimumCapacity,
+        int defaultMaximumCapacity,
+        CapacityAuditRecord? audit,
+        CancellationToken cancellationToken);
+}
+
+public interface IRunnerCapacityStateLease : IAsyncDisposable
+{
+    RunnerCapacityState State { get; }
+
+    Task CompleteAsync(int minimumCapacity, int maximumCapacity, string? outcome, CancellationToken cancellationToken);
+
+    Task FailUncertainAsync(CancellationToken cancellationToken);
 }

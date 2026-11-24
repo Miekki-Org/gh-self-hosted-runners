@@ -31,13 +31,20 @@ public sealed class RunnerImageResolverCliTests
         Assert.Equal(
             ["10.0.101"],
             request.GetProperty("dotNetSdks").EnumerateArray().Select(value => value.GetString()));
-        Assert.Equal("8.5.0-2ubuntu10.7", request.GetProperty("packages").GetProperty("curl").GetString());
+        var packages = request.GetProperty("packages");
+        Assert.Equal(6, packages.EnumerateObject().Count());
+        Assert.Equal("8.5.0-2ubuntu10.7", packages.GetProperty("curl").GetString());
+        Assert.Equal("1:2.34.1-1ubuntu1.10", packages.GetProperty("git").GetString());
+        Assert.Equal("1.6-2ubuntu0.1", packages.GetProperty("jq").GetString());
+        Assert.Equal("1.34-1ubuntu1", packages.GetProperty("tar").GetString());
+        Assert.Equal("6.0-26ubuntu0.1", packages.GetProperty("unzip").GetString());
+        Assert.Equal("1.21.2-1ubuntu1", packages.GetProperty("wget").GetString());
         Assert.Equal("2.331.0", request.GetProperty("runnerVersion").GetString());
         Assert.Equal(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             request.GetProperty("runnerSha256").GetString());
         Assert.Equal(
-            "434cf311fd065b45fc73eab677a957556d661af1588060a139033e97d693180a",
+            "16e5aa0d1067130d900b5438d5b6676f1459c2bc117c084f40aa19c06ee799a5",
             resolved.RootElement.GetProperty("manifestDigest").GetString());
         Assert.Equal(15, resolved.RootElement.GetProperty("validation").GetProperty("healthWindowMinutes").GetInt32());
         Assert.Equal(2, resolved.RootElement.GetProperty("retention").GetProperty("previousValidated").GetInt32());

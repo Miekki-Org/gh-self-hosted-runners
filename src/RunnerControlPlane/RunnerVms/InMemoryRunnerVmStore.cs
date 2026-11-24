@@ -6,6 +6,7 @@ public sealed class InMemoryRunnerVmStore : IRunnerVmStore
 {
     private readonly ConcurrentDictionary<string, RunnerVmRecord> _runnerVms = new(StringComparer.Ordinal);
     private readonly ConcurrentQueue<RunnerVmAuditRecord> _auditTrail = new();
+    private readonly object _gate = new();
 
     public IReadOnlyList<RunnerVmRecord> List()
     {
@@ -47,14 +48,17 @@ public sealed class InMemoryRunnerVmStore : IRunnerVmStore
 
     public RunnerVmRecord Update(string id, Func<RunnerVmRecord, RunnerVmRecord> update)
     {
-        if (!_runnerVms.TryGetValue(id, out var existing))
+        lock (_gate)
         {
-            throw new KeyNotFoundException($"Runner VM '{id}' was not found.");
-        }
+            if (!_runnerVms.TryGetValue(id, out var existing))
+            {
+                throw new KeyNotFoundException($"Runner VM '{id}' was not found.");
+            }
 
-        var updated = update(existing);
-        _runnerVms[id] = updated;
-        return updated;
+            var updated = update(existing);
+            _runnerVms[id] = updated;
+            return updated;
+        }
     }
 
     public RunnerVmRecord Retire(string id, string outcome, string? message = null)
@@ -64,35 +68,38 @@ public sealed class InMemoryRunnerVmStore : IRunnerVmStore
 
     public RunnerVmRecord Retire(string id, string outcome, string actor, string? message, string action)
     {
-        var existing = _runnerVms.GetOrAdd(id, _ => throw new KeyNotFoundException($"Runner VM '{id}' was not found."));
-        var normalizedOutcome = outcome ?? "Success";
-        var updated = existing with
+        lock (_gate)
         {
-            Status = RunnerVmStatus.Finished,
-            JobStatus = "finished",
-            Outcome = normalizedOutcome,
-            IsRetired = true,
-            RetryScheduled = false,
-            AcceptingJobs = false,
-            FailureReason = message,
-            UpdatedAt = DateTimeOffset.UtcNow
-        };
+            var existing = _runnerVms.GetOrAdd(id, _ => throw new KeyNotFoundException($"Runner VM '{id}' was not found."));
+            var normalizedOutcome = outcome ?? "Success";
+            var updated = existing with
+            {
+                Status = RunnerVmStatus.Finished,
+                JobStatus = "finished",
+                Outcome = normalizedOutcome,
+                IsRetired = true,
+                RetryScheduled = false,
+                AcceptingJobs = false,
+                FailureReason = message,
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
 
-        _runnerVms[id] = updated;
-        _auditTrail.Enqueue(new RunnerVmAuditRecord(
-            actor,
-            DateTimeOffset.UtcNow,
-            action,
-            NormalizeAuditOutcome(normalizedOutcome, action)));
-        return updated;
+            _runnerVms[id] = updated;
+            _auditTrail.Enqueue(new RunnerVmAuditRecord(
+                actor,
+                DateTimeOffset.UtcNow,
+                action,
+                NormalizeAuditOutcome(normalizedOutcome, action)));
+            return updated;
+        }
     }
 
     public IReadOnlyList<RunnerVmAuditRecord> GetAuditTrail()
     {
-        return _auditTrail.ToArray();
+        lock (_gate) return _auditTrail.ToArray();
     }
 
-    private static string NormalizeAuditOutcome(string outcome, string action)
+    internal static string NormalizeAuditOutcome(string outcome, string action)
     {
         if (string.Equals(outcome, "Success", StringComparison.OrdinalIgnoreCase)
             || string.Equals(outcome, "Succeeded", StringComparison.OrdinalIgnoreCase))
